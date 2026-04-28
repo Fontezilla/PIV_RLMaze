@@ -1,0 +1,63 @@
+pipelines:
+  blue:
+    description: Entry direto para Exit
+    sequence:
+      - entry
+      - exit
+    constraints:
+      entry:
+        - entryA
+        - entryB
+        - entryC
+        - entryD
+      exit:
+        - exitA
+        - exitB
+        - exitC
+        - exitD
+
+  red:
+    description: Entry passa por ProcessA e ProcessB antes de sair
+    sequence:
+      - entry
+      - processA
+      - processB
+      - exit
+    constraints:
+      entry:
+        - entryA
+        - entryB
+        - entryC
+        - entryD
+      processA:
+        - processA1_entry
+        - processA2_entry
+      processB:
+        - processB1_entry
+        - processB2_entry
+      exit:
+        - exitA
+        - exitB
+        - exitC
+        - exitD
+
+  green:
+    description: Entry passa por ProcessA antes de sair
+    sequence:
+      - entry
+      - processA
+      - exit
+    constraints:
+      entry:
+        - entryA
+        - entryB
+        - entryC
+        - entryD
+      processA:
+        - processA1_entry
+        - processA2_entry
+      exit:
+        - exitA
+        - exitB
+        - exitC
+        - exitD
