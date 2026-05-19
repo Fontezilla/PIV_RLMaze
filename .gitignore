@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+py3.10/
+
+# Checkpoints e modelos
+checkpoints/
+*.pt
+*.pth
+
+# Cache do grafo
+*.pkl
+
+# Logs e debug
+*.csv
+*.log
+wandb/
+runs/
+
+# Configs locais sensíveis
+.env
+*.local.yaml
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code
+.claude/
