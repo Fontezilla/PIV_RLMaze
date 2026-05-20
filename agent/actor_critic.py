@@ -139,6 +139,8 @@ class HeteroGNN(nn.Module):
                     ("robot",   "at",        "mapnode"): SAGEConv(hidden_dim, hidden_dim),
                     ("box",     "at",        "mapnode"): SAGEConv(hidden_dim, hidden_dim),
                     ("robot",   "carries",   "box"):     SAGEConv(hidden_dim, hidden_dim),
+                    ("mapnode", "has_robot", "robot"):   SAGEConv(hidden_dim, hidden_dim),
+                    ("box",     "carried_by","robot"):   SAGEConv(hidden_dim, hidden_dim),
                     ("box",     "next_wp",   "mapnode"): SAGEConv(hidden_dim, hidden_dim),
                     ("mapnode", "connected", "mapnode"): SAGEConv(hidden_dim, hidden_dim),
                 },
@@ -306,6 +308,10 @@ class AssignmentHead(nn.Module):
                     candidate_keys.append(("node", node_id))
 
             # --- Opção idle ---
+            # Sempre presente como safety net (caso todas as outras opções
+            # sejam consumidas por robots anteriores na mesma decisão).
+            # O masking de idle quando há trabalho útil é aplicado fora,
+            # nas funções de sampling/argmax.
             candidate_embeddings.append(self.W_candidate(self.idle_embedding))
             candidate_keys.append(("idle", -1))
 
@@ -507,14 +513,39 @@ def sample_actions(
     return actions, torch.stack(log_probs)
 
 
+def _apply_idle_mask(
+    logits     : Tensor,
+    candidates : list[CandidateKey],
+) -> Tensor:
+    """
+    Mascara a opção idle (-inf) se existir pelo menos um candidato não-idle
+    com logit válido (não -inf). Idle só permanece disponível quando o robot
+    genuinamente não tem trabalho — evita robots a bloquearem o mapa em IDLE
+    com caixas por entregar.
+    """
+    has_non_idle_valid = False
+    for j, (ctype, _) in enumerate(candidates):
+        if ctype != "idle" and logits[j].item() != float("-inf"):
+            has_non_idle_valid = True
+            break
+
+    if not has_non_idle_valid:
+        return logits
+
+    for j, (ctype, _) in enumerate(candidates):
+        if ctype == "idle":
+            logits[j] = float("-inf")
+    return logits
+
+
 def sample_actions_sequential(
     decisions: list[RobotDecision],
 ) -> tuple[list[tuple[int, int]], Tensor]:
     """
-    Amostra acções sequencialmente, maskando caixas já assignadas.
+    Amostra acções sequencialmente, maskando caixas e nós já assignados.
 
-    Cada robot vê apenas as caixas que nenhum robot anterior escolheu
-    neste step. Garante que dois robots nunca concorrem pela mesma caixa.
+    Cada robot vê apenas as caixas/nós que nenhum robot anterior escolheu
+    neste step. Garante que dois robots nunca concorrem pelo mesmo alvo.
 
     Devolve
     -------
@@ -522,15 +553,20 @@ def sample_actions_sequential(
     log_probs : Tensor [n_pending]
     """
     assigned_boxes: set[int] = set()
+    assigned_nodes: set[str] = set()
     actions   : list[tuple[int, int]] = []
     log_probs : list[Tensor]          = []
 
     for decision in decisions:
-        # Máscara: põe -inf nas caixas já assignadas
+        # Máscara: põe -inf nos alvos já assignados
         logits = decision.logits.clone()
         for j, (ctype, cid) in enumerate(decision.candidates):
             if ctype == "box" and int(cid) in assigned_boxes:
                 logits[j] = float("-inf")
+            elif ctype == "node" and str(cid) in assigned_nodes:
+                logits[j] = float("-inf")
+
+        logits = _apply_idle_mask(logits, decision.candidates)
 
         dist     = torch.distributions.Categorical(logits=logits)
         action   = dist.sample()
@@ -539,12 +575,14 @@ def sample_actions_sequential(
         actions.append((decision.robot_idx, int(action.item())))
         log_probs.append(log_prob)
 
-        # Regista a caixa escolhida para masking dos robots seguintes
+        # Regista o alvo escolhido para masking dos robots seguintes
         chosen = int(action.item())
         if chosen < len(decision.candidates):
             ctype, cid = decision.candidates[chosen]
             if ctype == "box":
                 assigned_boxes.add(int(cid))
+            elif ctype == "node":
+                assigned_nodes.add(str(cid))
 
     if not log_probs:
         return actions, torch.zeros(0)
@@ -606,6 +644,7 @@ def compute_log_probs_sequential(
     Tensor [n_pending]
     """
     assigned_boxes: set[int] = set()
+    assigned_nodes: set[str] = set()
     log_probs: list[Tensor] = []
 
     for decision, action_idx, orig_candidates in zip(
@@ -615,6 +654,10 @@ def compute_log_probs_sequential(
         for j, (ctype, cid) in enumerate(decision.candidates):
             if ctype == "box" and int(cid) in assigned_boxes:
                 logits[j] = float("-inf")
+            elif ctype == "node" and str(cid) in assigned_nodes:
+                logits[j] = float("-inf")
+
+        logits = _apply_idle_mask(logits, decision.candidates)
 
         dist = torch.distributions.Categorical(logits=logits)
         log_probs.append(
@@ -626,6 +669,8 @@ def compute_log_probs_sequential(
             ctype, cid = orig_candidates[action_idx]
             if ctype == "box":
                 assigned_boxes.add(int(cid))
+            elif ctype == "node":
+                assigned_nodes.add(str(cid))
 
     if not log_probs:
         return torch.zeros(0)

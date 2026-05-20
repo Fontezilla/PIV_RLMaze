@@ -43,6 +43,13 @@ HEADER_COLOR = (255, 220, 80)
 PARKING_POINT_COLOR = (185, 185, 195)
 PARKING_POINT_BORDER = (90, 90, 105)
 
+BOX_PIPELINE_COLORS: dict[str, tuple[int, int, int]] = {
+    "BLUE":  (80, 160, 255),
+    "GREEN": (80, 210, 100),
+    "RED":   (255, 90,  90),
+}
+BOX_ICON_SIZE = 5
+
 NODE_RADIUS = 9
 ROBOT_RADIUS = 11
 
@@ -160,6 +167,7 @@ class Renderer:
         self._draw_parking_points()
         self._draw_goal_lines(world, overrides)
         self._draw_nodes(world)
+        self._draw_boxes(world, info, overrides)
         self._draw_robots(world, overrides)
         self._draw_panel(world, info)
 
@@ -322,6 +330,48 @@ class Renderer:
                 (pos[0] - lbl.get_width() // 2, pos[1] - ROBOT_RADIUS - 14),
             )
 
+    def _draw_boxes(self, world: World, info: dict | None, overrides: dict | None) -> None:
+        """Desenha caixas WAITING (diamante no nó) e IN_TRANSIT (ponto no robot)."""
+        if not info:
+            return
+        boxes = info.get("boxes") or []
+
+        robot_pos: dict[str, tuple[int, int]] = {}
+        for r in world.all_robots():
+            pos = overrides.get(r.id) if overrides else None
+            if pos is None:
+                pos = self._robot_screen_pos(r)
+            if pos is not None:
+                robot_pos[r.id] = (int(pos[0]), int(pos[1]))
+
+        s = BOX_ICON_SIZE
+        for box in boxes:
+            status   = box.get("status", "")
+            pipeline = box.get("pipeline", "BLUE")
+            color    = BOX_PIPELINE_COLORS.get(pipeline, (180, 180, 180))
+
+            if status == "WAITING":
+                node = box.get("current_node")
+                if node is None:
+                    continue
+                try:
+                    px, py = self._to_screen(node)
+                except Exception:
+                    continue
+                cy = py - NODE_RADIUS - 4 - s
+                pts = [(px, cy - s), (px + s, cy), (px, cy + s), (px - s, cy)]
+                pygame.gfxdraw.filled_polygon(self._screen, pts, (*color, 210))
+                pygame.gfxdraw.aapolygon(self._screen, pts, color)
+
+            elif status == "IN_TRANSIT":
+                carrier = box.get("carried_by")
+                if carrier is None or carrier not in robot_pos:
+                    continue
+                rx, ry = robot_pos[carrier]
+                ox, oy = rx + ROBOT_RADIUS - 2, ry - ROBOT_RADIUS + 2
+                pygame.gfxdraw.filled_circle(self._screen, ox, oy, 4, (*color, 230))
+                pygame.gfxdraw.aacircle(self._screen, ox, oy, 4, color)
+
     def _draw_triangle(
         self,
         center: tuple[int, int],
@@ -388,6 +438,8 @@ class Renderer:
         if info:
             sep(4)
             for k, v in info.items():
+                if k == "boxes":
+                    continue
                 txt(f"{k:<12} {v}", DIM_TEXT, self._font_sm)
 
         txt(f"SubSteps {self.sub_steps}", DIM_TEXT, self._font_sm)
@@ -430,6 +482,28 @@ class Renderer:
 
             txt(f"    goal: {r.goal_node or '—'}", DIM_TEXT, self._font_sm)
             sep(4)
+
+        boxes = (info or {}).get("boxes") or []
+        if boxes:
+            sep(12)
+            hline()
+            delivered = sum(1 for b in boxes if b.get("status") == "DONE")
+            txt(f"BOXES  {delivered}/{len(boxes)}", HEADER_COLOR, self._font_lg)
+            sep(2)
+            for box in boxes:
+                status   = box.get("status", "")
+                if status == "DONE":
+                    continue
+                pipeline = box.get("pipeline", "BLUE")
+                bc       = BOX_PIPELINE_COLORS.get(pipeline, TEXT_COLOR)
+                bid      = box.get("box_id", "?")
+                nxt      = box.get("next_waypoint") or "?"
+                if status == "WAITING":
+                    node = box.get("current_node") or "?"
+                    txt(f"  b{bid} {pipeline[:3]} WAIT @{node}", bc, self._font_sm)
+                elif status == "IN_TRANSIT":
+                    carrier = box.get("carried_by") or "?"
+                    txt(f"  b{bid} {pipeline[:3]} TRNS {carrier} →{nxt}", bc, self._font_sm)
 
         hint_y = self.window_height - 72
 

@@ -73,6 +73,12 @@ class Box:
     status       : BoxStatus  = BoxStatus.WAITING
     carried_by   : str | None = None
 
+    # Índices de waypoints que, ao serem alcançados, devem fazer
+    # auto-advance para o waypoint seguinte (par de processo: o
+    # processX_entry de cada par está aqui, indicando que a caixa
+    # deve passar instantaneamente para o processX_exit emparelhado).
+    auto_advance_indices : set[int] = field(default_factory=set)
+
     # ------------------------------------------------------------------
     # Propriedades de conveniência
     # ------------------------------------------------------------------

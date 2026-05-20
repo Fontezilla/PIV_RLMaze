@@ -276,6 +276,16 @@ def build_hetero_graph(state: dict[str, Any]) -> HeteroData:
         r_carries_src, r_carries_dst, n_robots, n_boxes
     )
 
+    # --- (mapnode, has_robot, robot) --- reverse de (robot, at, mapnode)
+    data["mapnode", "has_robot", "robot"].edge_index = _make_edge_index(
+        r_at_dst, r_at_src, n_mapnodes, n_robots
+    )
+
+    # --- (box, carried_by, robot) --- reverse de (robot, carries, box)
+    data["box", "carried_by", "robot"].edge_index = _make_edge_index(
+        r_carries_dst, r_carries_src, n_boxes, n_robots
+    )
+
     # --- (box, next_wp, mapnode) ---
     b_wp_src, b_wp_dst = [], []
     for i, b in enumerate(active_boxes):
@@ -316,10 +326,11 @@ def build_hetero_graph(state: dict[str, Any]) -> HeteroData:
         if bid in box_id_to_idx and bid not in seen_box:
             data.available_box_indices.append(box_id_to_idx[bid])
             seen_box.add(bid)
+    preposition_ids = set(state.get("preposition_nodes", []))
     data.preposition_node_indices = [
         mapnode_id_to_idx[nid]
         for nid in mapnode_ids
-        if graph_nodes[nid]["type"] in _PREPOSITION_TYPES
+        if nid in preposition_ids
     ]
 
     # Mapeamentos inversos (para descodificar acções)
@@ -416,6 +427,8 @@ EDGE_TYPES = [
     ("robot",   "at",        "mapnode"),
     ("box",     "at",        "mapnode"),
     ("robot",   "carries",   "box"),
+    ("mapnode", "has_robot", "robot"),
+    ("box",     "carried_by","robot"),
     ("box",     "next_wp",   "mapnode"),
     ("mapnode", "connected", "mapnode"),
 ]

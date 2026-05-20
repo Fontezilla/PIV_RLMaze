@@ -225,6 +225,7 @@ class Policy:
         entropy_coef: float = 0.01,
         n_epochs   : int   = 4,
         normalize_advantages: bool = True,
+        trajectory : list | None = None,
     ) -> dict[str, float]:
         """
         Actualiza os pesos da rede com PPO.
@@ -245,7 +246,8 @@ class Policy:
         dict com métricas de treino:
           policy_loss, value_loss, entropy, total_loss, approx_kl
         """
-        if not self._trajectory:
+        traj = trajectory if trajectory is not None else self._trajectory
+        if not traj:
             return {}
 
         self.net.train()
@@ -253,7 +255,7 @@ class Policy:
         # ------------------------------------------------------------------
         # 1. Calcula retornos e vantagens (GAE)
         # ------------------------------------------------------------------
-        returns, advantages = self._compute_gae(gamma, lam)
+        returns, advantages = self._compute_gae(gamma, lam, traj)
 
         advantages_t = torch.stack(advantages)
         if normalize_advantages and advantages_t.std() > 1e-8:
@@ -263,8 +265,8 @@ class Policy:
         # ------------------------------------------------------------------
         # 2. Recolhe dados antigos (old_log_probs, values)
         # ------------------------------------------------------------------
-        old_log_probs_list = [t.log_probs for t in self._trajectory]
-        old_values_list    = [t.value     for t in self._trajectory]
+        old_log_probs_list = [t.log_probs for t in traj]
+        old_values_list    = [t.value     for t in traj]
 
         # ------------------------------------------------------------------
         # 3. Épocas PPO
@@ -277,7 +279,7 @@ class Policy:
         }
 
         for _ in range(n_epochs):
-            for i, transition in enumerate(self._trajectory):
+            for i, transition in enumerate(traj):
                 if not transition.action_indices:
                     continue
 
@@ -345,8 +347,9 @@ class Policy:
 
     def _compute_gae(
         self,
-        gamma : float,
-        lam   : float,
+        gamma      : float,
+        lam        : float,
+        trajectory : list | None = None,
     ) -> tuple[list[Tensor], list[Tensor]]:
         """
         Calcula retornos e vantagens GAE para toda a trajectória.
@@ -356,7 +359,8 @@ class Policy:
         returns    : list[Tensor escalar] — retorno descontado por step
         advantages : list[Tensor escalar] — vantagem GAE por step
         """
-        n          = len(self._trajectory)
+        traj       = trajectory if trajectory is not None else self._trajectory
+        n          = len(traj)
         returns    : list[Tensor] = [torch.zeros(1)] * n
         advantages : list[Tensor] = [torch.zeros(1)] * n
 
@@ -364,7 +368,7 @@ class Policy:
         next_value = 0.0
 
         for i in reversed(range(n)):
-            t          = self._trajectory[i]
+            t          = traj[i]
             reward     = t.reward
             value      = t.value.detach().item()
             done       = t.done
@@ -393,7 +397,7 @@ class Policy:
     def load(self, path: str) -> None:
         """Carrega os pesos da rede."""
         self.net.load_state_dict(
-            torch.load(path, map_location=self.device)
+            torch.load(path, map_location=self.device, weights_only=True)
         )
 
     def parameters(self):
@@ -417,6 +421,7 @@ def _argmax_actions(
     log_probs      : Tensor [n_pending]
     """
     assigned_boxes: set[int]   = set()
+    assigned_nodes: set[str]   = set()
     action_indices: list[int]  = []
     log_probs     : list[Tensor] = []
 
@@ -425,10 +430,22 @@ def _argmax_actions(
         for j, (ctype, cid) in enumerate(decision.candidates):
             if ctype == "box" and int(cid) in assigned_boxes:
                 logits[j] = float("-inf")
+            elif ctype == "node" and str(cid) in assigned_nodes:
+                logits[j] = float("-inf")
+
+        # Mascara idle se houver alternativas válidas (não bloqueadas).
+        has_non_idle_valid = any(
+            decision.candidates[j][0] != "idle" and logits[j].item() != float("-inf")
+            for j in range(len(decision.candidates))
+        )
+        if has_non_idle_valid:
+            for j, (ctype, _) in enumerate(decision.candidates):
+                if ctype == "idle":
+                    logits[j] = float("-inf")
 
         dist     = torch.distributions.Categorical(logits=logits)
         action   = int(logits.argmax().item())
-        log_prob = dist.log_prob(torch.tensor(action))
+        log_prob = dist.log_prob(torch.tensor(action, device=logits.device))
 
         action_indices.append(action)
         log_probs.append(log_prob)
@@ -437,6 +454,8 @@ def _argmax_actions(
             ctype, cid = decision.candidates[action]
             if ctype == "box":
                 assigned_boxes.add(int(cid))
+            elif ctype == "node":
+                assigned_nodes.add(str(cid))
 
     if not log_probs:
         return action_indices, torch.zeros(0)

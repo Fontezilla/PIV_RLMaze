@@ -119,12 +119,32 @@ class BoxManager:
         self._spawn_queue.clear()
         self._next_id = 0
 
-        # Cria todas as caixas com pipelines e waypoints já definidos
-        for _ in range(self._n_boxes):
-            box = self._create_pending_box()
+        # Recolhe todos os entries possíveis (iguais em todos os pipelines)
+        all_entries: list[str] = []
+        for cfg in self._pipeline_cfg.values():
+            entries = [
+                o for o in cfg.get("constraints", {}).get("entry", [])
+                if isinstance(o, str)
+            ]
+            if entries:
+                all_entries = entries
+                break
+
+        # Atribui entries sem repetição quando n_boxes <= n_entries,
+        # garantindo que todas as caixas spawnham imediatamente
+        if all_entries and len(all_entries) >= self._n_boxes:
+            entry_pool = self._rng.sample(all_entries, self._n_boxes)
+        elif all_entries:
+            entry_pool = [all_entries[i % len(all_entries)] for i in range(self._n_boxes)]
+            self._rng.shuffle(entry_pool)
+        else:
+            entry_pool = [None] * self._n_boxes
+
+        for forced_entry in entry_pool:
+            box = self._create_pending_box(forced_entry=forced_entry)
             self._spawn_queue.append(box)
 
-        # Coloca as que couberem imediatamente
+        # Coloca as que couberem imediatamente (com entries distintos, são todas)
         self.tick_spawn()
 
     def tick_spawn(self) -> list[int]:
@@ -198,6 +218,11 @@ class BoxManager:
 
         Só faz drop se o nó for o next_waypoint da caixa.
 
+        Se o drop ocorrer num processX_entry com par auto_advance, a caixa
+        avança instantaneamente para o processX_exit emparelhado (se livre).
+        A recompensa só é atribuída pelo drop manual — o auto-advance é
+        uma acção do ambiente, não do agente.
+
         Devolve (reward, delivered, box_id).
           reward    : reward do evento (waypoint ou entrega)
           delivered : True se foi entrega final
@@ -219,7 +244,61 @@ class BoxManager:
         robot.carrying_box = None
 
         reward = REWARD_DELIVERY if delivered else REWARD_WAYPOINT
+
+        # Auto-advance através de estações de processamento.
+        # Se o par exit estiver ocupado, a caixa fica WAITING no entry
+        # e tick_process_advance() tentará de novo nos ticks seguintes.
+        if not delivered:
+            self._try_auto_advance(box)
+
         return reward, delivered, box_id
+
+    def tick_process_advance(self) -> list[int]:
+        """
+        Polling: tenta avançar caixas paradas em waypoints com auto_advance
+        para o waypoint seguinte (par de processo), quando o destino estiver
+        livre.
+
+        Útil quando o exit estava ocupado no momento do drop e ficou livre
+        mais tarde (e.g. outro robot apanhou a caixa de lá).
+
+        Devolve box_ids que avançaram neste tick.
+        """
+        advanced: list[int] = []
+        for box in self._boxes.values():
+            if not box.is_waiting:
+                continue
+            current_idx = box.waypoint_idx - 1
+            if current_idx not in box.auto_advance_indices:
+                continue
+            before = box.current_node
+            self._try_auto_advance(box)
+            if box.current_node != before:
+                advanced.append(box.box_id)
+        return advanced
+
+    def _try_auto_advance(self, box: Box) -> bool:
+        """
+        Avança automaticamente a caixa enquanto o waypoint actual estiver
+        marcado em auto_advance_indices e o destino seguinte estiver livre.
+
+        Devolve True se a caixa ficou entregue (improvável aqui — não há
+        pares em que o segundo elemento seja o exit final).
+        """
+        while True:
+            current_idx = box.waypoint_idx - 1
+            if current_idx not in box.auto_advance_indices:
+                return False
+            next_wp = box.next_waypoint
+            if next_wp is None:
+                return False
+            if not self.is_node_drop_available(next_wp):
+                # Destino bloqueado — caixa fica no entry e tenta-se de novo
+                # em tick_process_advance() quando o destino libertar.
+                return False
+            delivered = box.advance_waypoint(next_wp)
+            if delivered:
+                return True
 
     # ------------------------------------------------------------------
     # Consultas de estado  (usadas pelo agente RL e pelo FactoryEnv)
@@ -311,7 +390,7 @@ class BoxManager:
     # Internos — criação de caixas
     # ------------------------------------------------------------------
 
-    def _create_pending_box(self) -> Box:
+    def _create_pending_box(self, forced_entry: str | None = None) -> Box:
         """
         Cria uma caixa com pipeline e waypoints já determinados,
         mas sem a colocar no ambiente (fica em fila de espera).
@@ -319,46 +398,64 @@ class BoxManager:
         pipeline_name = self._rng.choice(list(self._pipeline_cfg.keys()))
         pipeline_type = _PIPELINE_MAP[pipeline_name]
         cfg           = self._pipeline_cfg[pipeline_name]
-        waypoints     = self._build_waypoints(cfg)
+        waypoints, auto_advance_indices = self._build_waypoints(
+            cfg, forced_entry=forced_entry,
+        )
 
         box = Box(
-            box_id       = self._next_id,
-            pipeline     = pipeline_type,
-            waypoints    = waypoints,
-            current_node = waypoints[0],
-            status       = BoxStatus.WAITING,
+            box_id               = self._next_id,
+            pipeline             = pipeline_type,
+            waypoints            = waypoints,
+            current_node         = waypoints[0],
+            status               = BoxStatus.WAITING,
+            auto_advance_indices = auto_advance_indices,
         )
         self._next_id += 1
         return box
 
-    def _build_waypoints(self, cfg: dict) -> list[str]:
+    def _build_waypoints(
+        self,
+        cfg          : dict,
+        forced_entry : str | None = None,
+    ) -> tuple[list[str], set[int]]:
         """
-        Constrói a lista de waypoints para uma pipeline.
+        Constrói a lista de waypoints para uma pipeline e o conjunto de
+        índices que devem fazer auto-advance.
 
         cfg["sequence"]    → ordem dos passos (ex: ["entry","processA","exit"])
         cfg["constraints"] → passo → lista de opções
+        forced_entry       → se definido, usa este nó como entry em vez de sortear
 
         Cada opção pode ser:
           - str  → nó único  (ex: "entryA")
           - list → par de nós para uma estação de processo
                    (ex: ["processA1_entry","processA1_exit"])
-                   Os dois nós são adicionados como waypoints consecutivos.
+                   Os dois nós são adicionados como waypoints consecutivos
+                   e o primeiro fica marcado como auto-advance (o processo
+                   transfere a caixa internamente do entry para o exit).
         """
         waypoints: list[str] = []
+        auto_advance_indices: set[int] = set()
         constraints: dict[str, list] = cfg.get("constraints", {})
 
         for step in cfg.get("sequence", []):
             options = constraints.get(step, [])
             if not options:
                 continue
-            choice = self._rng.choice(options)
+            if step == "entry" and forced_entry is not None:
+                choice = forced_entry
+            else:
+                choice = self._rng.choice(options)
             if isinstance(choice, list):
-                # Par (entry + exit) de uma estação de processo
+                # Par (entry + exit) de uma estação de processo.
+                # Marca o entry para auto-advance instantâneo até ao exit.
+                entry_idx = len(waypoints)
                 waypoints.extend(choice)
+                auto_advance_indices.add(entry_idx)
             else:
                 waypoints.append(choice)
 
-        return waypoints
+        return waypoints, auto_advance_indices
 
     # ------------------------------------------------------------------
     # Internos — carregamento do yaml

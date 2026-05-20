@@ -423,6 +423,14 @@ class FactoryEnv:
                 self.router.register(robot)
                 self._mark_robot_pending(robot)
 
+        # 3b. Poll de auto-advance: caixas paradas em processX_entry
+        #     onde o exit emparelhado entretanto ficou livre (e.g. outro
+        #     robot apanhou a caixa que estava no exit) avançam agora.
+        newly_advanced_boxes = self._box_manager.tick_process_advance()
+        for adv_id in newly_advanced_boxes:
+            if adv_id not in newly_available_boxes:
+                newly_available_boxes.append(adv_id)
+
         # 4. Liberta nós de origem
         self.router.sync_moving_node_locks(self.world.all_robots())
 
@@ -469,24 +477,61 @@ class FactoryEnv:
 
     def _try_auto_pick(self, robot: Robot) -> float:
         """
-        Pick automático se o robot chegou ao nó da caixa que lhe foi assignada.
+        Pick automático quando o robot chega ao nó de uma caixa.
 
-        Só tenta apanhar a caixa explicitamente assignada pelo agente
-        (robot.assigned_box_id). Evita apanhar caixas erradas caso o nó
-        coincida com outra caixa disponível no mesmo tick.
+        Prioridade:
+          1. Caixa explicitamente assignada pelo agente (assigned_box_id):
+             se está disponível neste nó, apanha-a.
+             Se o robot tem assignment mas a caixa não está aqui, não faz
+             pickup oportunista — está em trânsito para outro destino.
+          2. Sem assignment explícito (pré-posição ou robot livre): apanha
+             qualquer caixa disponível neste nó que não esteja reservada
+             a outro robot e cujo próximo waypoint esteja livre.
         """
-        if robot.current_node is None or robot.assigned_box_id is None:
+        if robot.current_node is None:
             return 0.0
 
-        box = self._box_manager.get_box(robot.assigned_box_id)
-        if box is None or not box.is_available or box.current_node != robot.current_node:
+        # --- 1. Assignment explícito ---
+        if robot.assigned_box_id is not None:
+            box = self._box_manager.get_box(robot.assigned_box_id)
+            if (
+                box is not None
+                and box.is_available
+                and box.current_node == robot.current_node
+            ):
+                reward = self._box_manager.on_pick(robot, robot.assigned_box_id)
+                if reward > 0:
+                    robot.assigned_box_id = None
+                    self._sync_goal_to_waypoint(robot)
+                    return reward
+            # Tem assignment mas não está no nó certo — deixa o robot continuar
+            # em direcção à sua caixa-alvo sem apanhar outras pelo caminho.
             return 0.0
 
-        reward = self._box_manager.on_pick(robot, robot.assigned_box_id)
-        if reward > 0:
-            robot.assigned_box_id = None
-            self._sync_goal_to_waypoint(robot)
-            return reward
+        # --- 2. Pickup oportunista ---
+        if robot.carrying_box is not None:
+            return 0.0
+
+        all_robots = self.world.all_robots()
+        assigned_to_others = {
+            r.assigned_box_id
+            for r in all_robots
+            if r.id != robot.id and r.assigned_box_id is not None
+        }
+
+        for box in self._box_manager.available_boxes_at(robot.current_node):
+            if box.box_id in assigned_to_others:
+                continue
+            next_wp = box.next_waypoint
+            if next_wp is None:
+                continue
+            if not self._box_manager.is_node_drop_available(next_wp):
+                continue
+
+            reward = self._box_manager.on_pick(robot, box.box_id)
+            if reward > 0:
+                self._sync_goal_to_waypoint(robot)
+                return reward
 
         return 0.0
 
@@ -544,8 +589,9 @@ class FactoryEnv:
         # Conjunto de caixas já assignadas neste step
         assigned_boxes: set[int] = set()
         # Conjunto de next_waypoints reservados neste step
-        # (impede dois robots de levarem caixas diferentes para o mesmo nó)
         assigned_next_waypoints: set[str] = set()
+        # Conjunto de nós de pre-posição já assignados neste step
+        assigned_goals: set[str] = set()
 
         for robot in self._pending_robots:
             if not self.world.has_robot(robot.id):
@@ -592,6 +638,10 @@ class FactoryEnv:
 
             elif isinstance(target, str):
                 # Assignment para nó de pre-posição (sem caixa específica)
+                if target in assigned_goals:
+                    robot.state = RobotState.IDLE
+                    continue
+                assigned_goals.add(target)
                 self._set_robot_goal(robot, target)
 
         return reward
@@ -648,13 +698,50 @@ class FactoryEnv:
 
         Contém toda a informação necessária sem processamento.
         """
+        all_robots = self.world.all_robots() if self.world else []
+
+        # Robots pendentes vão re-decidir agora — as suas reservas anteriores
+        # não devem mascarar as caixas/nós disponíveis (senão o agente não as
+        # vê e o robot acaba sem assignment válido).
+        pending_ids: set[str] = {r.id for r in self._pending_robots}
+
+        # Caixas já assignadas (assigned_box_id set) mas ainda não apanhadas
+        already_assigned_boxes = {
+            r.assigned_box_id
+            for r in all_robots
+            if r.assigned_box_id is not None and r.id not in pending_ids
+        }
+
+        # Nós já usados como goal por outros robots
+        already_targeted_nodes = {
+            r.goal_node
+            for r in all_robots
+            if r.goal_node is not None and r.id not in pending_ids
+        }
+
+        # Pre-posições úteis: nós actuais de caixas disponíveis
+        # + próximos waypoints de caixas em trânsito
+        # → só faz sentido pré-posicionar onde as caixas estão ou vão parar
+        useful_preposition: set[str] = set()
+        for box in self._box_manager.active_boxes():
+            if box.is_waiting and box.current_node:
+                useful_preposition.add(box.current_node)
+            if box.is_in_transit and box.next_waypoint:
+                useful_preposition.add(box.next_waypoint)
+
         return {
             "tick":               self.world.tick if self.world else 0,
             "robots":             self.world.snapshot()["robots"] if self.world else [],
             "boxes":              self._box_manager.snapshot(),
             "pending_robot_ids":  [r.id for r in self._pending_robots],
-            "available_box_ids":  [b.box_id for b in self._box_manager.available_boxes()],
-            "preposition_nodes":  self.preposition_nodes,
+            "available_box_ids":  [
+                b.box_id for b in self._box_manager.available_boxes()
+                if b.box_id not in already_assigned_boxes
+            ],
+            "preposition_nodes":  [
+                n for n in self.preposition_nodes
+                if n in useful_preposition and n not in already_targeted_nodes
+            ],
             "graph_nodes":        self._graph_node_features(),
             "graph_edges":        self._graph_edge_features(),
         }
@@ -721,7 +808,11 @@ class FactoryEnv:
             from render.renderer import Renderer
             self._renderer = Renderer(self.graph)
 
-        info   = {"tick": self.world.tick, "robots": self.world.robot_count()}
+        info = {
+            "tick":   self.world.tick,
+            "robots": self.world.robot_count(),
+            "boxes":  self._box_manager.snapshot(),
+        }
         result = self._renderer.render(self.world, info)
         if result == "quit":
             self.close()

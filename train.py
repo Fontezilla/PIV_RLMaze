@@ -24,9 +24,11 @@ Uso
 from __future__ import annotations
 
 import argparse
+import copy
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -40,6 +42,28 @@ from agent.policy import Policy
 # ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
+
+def _collect_episode(args: tuple) -> tuple[dict, list]:
+    """
+    Worker para recolha paralela de episódios.
+
+    Deve ser função de topo de módulo para ser serializável com o
+    contexto 'spawn' do multiprocessing (obrigatório no Windows).
+    """
+    cfg, state_dict, _seed = args
+
+    cfg_w = copy.deepcopy(cfg)
+    cfg_w["agent"]["device"] = "cpu"   # GPU não é partilhável entre processos
+
+    env    = make_env(cfg_w)
+    policy = make_policy(cfg_w)
+    policy.net.load_state_dict(state_dict)
+
+    metrics = run_episode(env, policy, deterministic=False, record=True)
+    traj    = list(policy.trajectory)
+    env.close()
+    return metrics, traj
+
 
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
@@ -96,6 +120,7 @@ def run_episode(
     policy      : Policy,
     deterministic: bool = False,
     record      : bool  = True,
+    debug       : bool  = False,
 ) -> dict[str, float]:
     """
     Corre um episódio completo.
@@ -106,6 +131,7 @@ def run_episode(
     policy        : política GNN + PPO
     deterministic : se True, usa argmax (avaliação)
     record        : se True, guarda trajectória para update
+    debug         : se True, imprime decisão por decisão no terminal
 
     Devolve
     -------
@@ -120,7 +146,25 @@ def run_episode(
     t_start      = time.time()
 
     while not done:
+        if debug:
+            tick    = state.get("tick", "?")
+            pending = [r.split("_")[-1] for r in state.get("pending_robot_ids", [])]
+            boxes   = {b["box_id"]: b for b in state.get("boxes", [])}
+            avail   = state.get("available_box_ids", [])
+            box_str = ", ".join(
+                f"b{bid}({boxes[bid]['pipeline'][0]})@{boxes[bid].get('current_node') or 'transit'}→{boxes[bid].get('next_waypoint') or '?'}"
+                for bid in avail if bid in boxes
+            ) or "—"
+            print(f"  t={tick:4d} | robots={pending} | avail=[{box_str}]", end="  ")
+
         assignments, transition = policy.act(state, deterministic=deterministic)
+
+        if debug:
+            asgn_str = ", ".join(
+                f"r{k.split('_')[-1]}→{'b'+str(v) if isinstance(v, int) else (v or 'idle')}"
+                for k, v in assignments.items()
+            ) if assignments else "—"
+            print(f"→ {asgn_str}")
 
         state, reward, terminated, truncated, info = env.step(assignments)
         done = terminated or truncated
@@ -166,7 +210,9 @@ def evaluate(
     all_done   = []
 
     for ep in range(n_episodes):
-        metrics = run_episode(env, policy, deterministic=True, record=False)
+        if render:
+            print(f"\n  [ep {ep+1}/{n_episodes}]")
+        metrics = run_episode(env, policy, deterministic=True, record=False, debug=render)
         rewards.append(metrics["total_reward"])
         deliveries.append(metrics["delivered"])
         ticks.append(metrics["ticks"])
@@ -247,64 +293,105 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
     print(f"{'='*60}\n")
 
     # --- Loop de treino ---
-    pbar = tqdm(
-        range(1, train_cfg["n_episodes"] + 1),
-        desc     = "Treino",
-        unit     = "ep",
-        dynamic_ncols = True,
-    )
+    n_workers    = train_cfg.get("n_workers", 1)
+    use_parallel = n_workers > 1
+    executor     = ProcessPoolExecutor(max_workers=n_workers) if use_parallel else None
+
+    pbar    = tqdm(total=train_cfg["n_episodes"], desc="Treino", unit="ep", dynamic_ncols=True)
+    episode = 0
 
     try:
-        for episode in pbar:
+        while episode < train_cfg["n_episodes"]:
+            prev_ep = episode
 
-            # Treino
-            ep_metrics = run_episode(env, policy, deterministic=False, record=True)
+            if use_parallel:
+                # ── Recolha paralela ──────────────────────────────────────
+                batch  = min(n_workers, train_cfg["n_episodes"] - episode)
+                cpu_sd = {k: v.cpu() for k, v in policy.net.state_dict().items()}
+                results = list(executor.map(
+                    _collect_episode,
+                    [(cfg, cpu_sd, episode + i) for i in range(batch)],
+                ))
+                combined_traj = [t for _, traj in results for t in traj]
+                metrics_list  = [m for m, _ in results]
 
-            update_metrics = policy.update(
-                optimizer            = optimizer,
-                gamma                = train_cfg["gamma"],
-                lam                  = train_cfg["lam"],
-                clip_eps             = train_cfg["clip_eps"],
-                value_coef           = train_cfg["value_coef"],
-                entropy_coef         = train_cfg["entropy_coef"],
-                n_epochs             = train_cfg["n_epochs"],
-                normalize_advantages = train_cfg["normalize_advantages"],
-            )
-            policy.clear()
+                update_metrics = policy.update(
+                    optimizer            = optimizer,
+                    gamma                = train_cfg["gamma"],
+                    lam                  = train_cfg["lam"],
+                    clip_eps             = train_cfg["clip_eps"],
+                    value_coef           = train_cfg["value_coef"],
+                    entropy_coef         = train_cfg["entropy_coef"],
+                    n_epochs             = train_cfg["n_epochs"],
+                    normalize_advantages = train_cfg["normalize_advantages"],
+                    trajectory           = combined_traj,
+                )
+                policy.clear()
 
-            # Actualiza barra de progresso
+                n = len(metrics_list)
+                ep_metrics = {
+                    "total_reward" : sum(m["total_reward"] for m in metrics_list) / n,
+                    "delivered"    : sum(m["delivered"]    for m in metrics_list) / n,
+                    "n_boxes"      : env.n_boxes,
+                    "all_delivered": any(m["all_delivered"] for m in metrics_list),
+                    "ticks"        : sum(m["ticks"]        for m in metrics_list) / n,
+                    "n_steps"      : sum(m["n_steps"]      for m in metrics_list) / n,
+                    "duration_s"   : sum(m["duration_s"]   for m in metrics_list) / n,
+                }
+                episode += batch
+                pbar.update(batch)
+
+            else:
+                # ── Recolha single-worker ─────────────────────────────────
+                ep_metrics = run_episode(env, policy, deterministic=False, record=True)
+                update_metrics = policy.update(
+                    optimizer            = optimizer,
+                    gamma                = train_cfg["gamma"],
+                    lam                  = train_cfg["lam"],
+                    clip_eps             = train_cfg["clip_eps"],
+                    value_coef           = train_cfg["value_coef"],
+                    entropy_coef         = train_cfg["entropy_coef"],
+                    n_epochs             = train_cfg["n_epochs"],
+                    normalize_advantages = train_cfg["normalize_advantages"],
+                )
+                policy.clear()
+                episode += 1
+                pbar.update(1)
+
+            # Barra de progresso
             pbar.set_postfix({
-                "R"       : f"{ep_metrics['total_reward']:.1f}",
-                "del"     : f"{ep_metrics['delivered']}/{env.n_boxes}",
-                "p_loss"  : f"{update_metrics.get('policy_loss', 0):.3f}",
-                "entropy" : f"{update_metrics.get('entropy', 0):.3f}",
+                "R"      : f"{ep_metrics['total_reward']:.1f}",
+                "del"    : f"{ep_metrics['delivered']:.1f}/{env.n_boxes}",
+                "p_loss" : f"{update_metrics.get('policy_loss', 0):.3f}",
+                "entropy": f"{update_metrics.get('entropy', 0):.3f}",
             })
 
-            # Log por episódio
+            # Log wandb
             log = {
-                "train/reward"       : ep_metrics["total_reward"],
-                "train/delivered"    : ep_metrics["delivered"],
-                "train/all_done"     : float(ep_metrics["all_delivered"]),
-                "train/ticks"        : ep_metrics["ticks"],
-                "train/steps"        : ep_metrics["n_steps"],
-                "train/duration_s"   : ep_metrics["duration_s"],
+                "train/reward"    : ep_metrics["total_reward"],
+                "train/delivered" : ep_metrics["delivered"],
+                "train/all_done"  : float(ep_metrics["all_delivered"]),
+                "train/ticks"     : ep_metrics["ticks"],
+                "train/steps"     : ep_metrics["n_steps"],
+                "train/duration_s": ep_metrics["duration_s"],
                 **{f"train/{k}": v for k, v in update_metrics.items()},
-                "episode"            : episode,
+                "episode"         : episode,
             }
-
             if use_wandb:
                 import wandb
                 wandb.log(log)
 
-            # Checkpoint periódico
-            if episode % ckpt_cfg["save_every"] == 0:
+            # Checkpoint — dispara ao cruzar múltiplo de save_every
+            save_every = ckpt_cfg["save_every"]
+            if (episode // save_every) > (prev_ep // save_every):
                 ckpt_path = ckpt_dir / f"checkpoint_ep{episode:05d}.pt"
                 policy.save(str(ckpt_path))
                 policy.save(str(ckpt_dir / "latest.pt"))
-                tqdm.write(f"  → checkpoint guardado: {ckpt_path}")
+                tqdm.write(f"  → checkpoint: {ckpt_path}")
 
-            # Avaliação periódica com render
-            if episode % eval_cfg["every_n_episodes"] == 0:
+            # Avaliação — dispara ao cruzar múltiplo de every_n_episodes
+            eval_every = eval_cfg["every_n_episodes"]
+            if (episode // eval_every) > (prev_ep // eval_every):
                 tqdm.write(f"\n--- Avaliação ep {episode} ---")
                 eval_metrics = evaluate(
                     cfg        = cfg,
@@ -312,27 +399,24 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
                     n_episodes = eval_cfg["n_eval_episodes"],
                     render     = eval_cfg["render"],
                 )
-
                 if use_wandb:
                     import wandb
                     wandb.log({**eval_metrics, "episode": episode})
-
                 tqdm.write(
                     f"  reward_mean={eval_metrics['eval/reward_mean']:.1f}  "
                     f"delivered_mean={eval_metrics['eval/delivered_mean']:.1f}  "
                     f"all_done_rate={eval_metrics['eval/all_done_rate']:.2f}\n"
                 )
-
-                # Guarda melhor modelo
                 if eval_metrics["eval/reward_mean"] > best_eval_reward:
                     best_eval_reward = eval_metrics["eval/reward_mean"]
                     policy.save(str(ckpt_dir / "best.pt"))
-                    tqdm.write(f"  → melhor modelo actualizado "
-                               f"(reward={best_eval_reward:.1f})")
+                    tqdm.write(f"  → melhor modelo ({best_eval_reward:.1f})")
 
     finally:
         pbar.close()
         env.close()
+        if executor is not None:
+            executor.shutdown(wait=True)
         if use_wandb:
             import wandb
             wandb.finish()

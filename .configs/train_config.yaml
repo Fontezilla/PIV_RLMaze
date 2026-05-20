@@ -3,8 +3,8 @@
 
 env:
   n_robots      : 4
-  n_boxes       : 8
-  tick_limit    : 5000
+  n_boxes       : 4
+  tick_limit    : 3000
   map_path      : .configs/map_factory.yaml
   cache_path    : .configs/graph_cache.pkl
   pipeline_path : .configs/box_pipeline.yaml
@@ -13,9 +13,10 @@ agent:
   hidden_dim  : 128
   n_layers    : 2
   dropout     : 0.1
-  device      : cpu          # "cpu" ou "cuda"
+  device      : cuda         # "cpu" ou "cuda"
 
 train:
+  n_workers         : 4      # ambientes em paralelo (1 = sem paralelismo)
   n_episodes        : 2000   # episódios de treino total
   lr                : 3.0e-4
   gamma             : 0.99
@@ -23,14 +24,14 @@ train:
   clip_eps          : 0.2    # PPO clipping
   value_coef        : 0.5
   entropy_coef      : 0.01
-  n_epochs          : 4      # épocas PPO por episódio
+  n_epochs          : 1      # épocas PPO por update (com n_workers=4 já tens 4x mais dados)
   max_grad_norm     : 0.5
   normalize_advantages: true
 
 eval:
   every_n_episodes  : 50     # avaliação a cada N episódios
   n_eval_episodes   : 5      # episódios de avaliação por ciclo
-  render            : true   # abre interface gráfica durante avaliação
+  render            : false  # abre interface gráfica durante avaliação
 
 checkpoints:
   dir               : checkpoints
