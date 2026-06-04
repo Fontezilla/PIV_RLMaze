@@ -42,43 +42,7 @@ def plan(
     congested_edges: set[tuple[str, str]] | dict[tuple[str, str], float] | None = None,
     immediate_reverse_penalty: float = REVERSE_EDGE_PENALTY,
 ) -> list[str] | None:
-    """
-    A* de src para dst com penalizações anti-loop e custos dinâmicos.
-
-    blocked_nodes:
-        Nós completamente bloqueados, excepto se forem o destino.
-
-    blocked_edges:
-        Segmentos completamente bloqueados.
-        Devem vir em formato canónico:
-            graph.segment_id(u, v)
-
-    avoid_nodes:
-        Nós a evitar quando possível.
-        Pode ser:
-            set[str]
-            dict[str, float]
-
-    avoid_edges:
-        Arestas direccionais a evitar quando possível.
-        Pode ser:
-            set[(u, v)]
-            dict[(u, v), float]
-
-    congested_nodes:
-        Nós ocupados, previstos ou muito disputados.
-        Não são bloqueados, mas recebem custo alto.
-
-    congested_edges:
-        Arestas ocupadas, previstas ou muito disputadas.
-        Pode aceitar arestas direccionais ou canónicas.
-
-    immediate_reverse_penalty:
-        Penalização forte para evitar A -> B -> A.
-
-    Retorna:
-        lista [src, ..., dst] ou None.
-    """
+    """A* de src para dst com penalizações anti-loop e custos dinâmicos."""
     blocked_nodes = blocked_nodes or set()
     blocked_edges = blocked_edges or set()
     avoid_nodes = avoid_nodes or {}
@@ -214,14 +178,7 @@ def _edge_penalty(
     v: str,
     avoid_edges: set[tuple[str, str]] | dict[tuple[str, str], float],
 ) -> float:
-    """
-    Penalização para arestas recentemente usadas.
-
-    Aqui são consideradas:
-        - aresta direccional: (u, v)
-        - aresta inversa: (v, u)
-        - aresta canónica: graph.segment_id(u, v)
-    """
+    """Penalização para arestas recentemente usadas."""
     directed = (u, v)
     reverse = (v, u)
     segment = graph.segment_id(u, v)
@@ -257,12 +214,7 @@ def _congestion_node_penalty(
     dst: str,
     congested_nodes: set[str] | dict[str, float],
 ) -> float:
-    """
-    Penalização para nós congestionados.
-
-    Ao contrário de blocked_nodes, isto não bloqueia o caminho.
-    Só torna esse caminho menos desejável.
-    """
+    """Penalização para nós congestionados."""
     if node == dst:
         return 0.0
 
@@ -281,14 +233,7 @@ def _congestion_edge_penalty(
     v: str,
     congested_edges: set[tuple[str, str]] | dict[tuple[str, str], float],
 ) -> float:
-    """
-    Penalização para arestas congestionadas, ocupadas ou previstas.
-
-    Aceita:
-        - (u, v)
-        - (v, u)
-        - graph.segment_id(u, v)
-    """
+    """Penalização para arestas congestionadas, ocupadas ou previstas."""
     directed = (u, v)
     reverse = (v, u)
     segment = graph.segment_id(u, v)
@@ -316,12 +261,7 @@ def _turn_penalty(
     at: str,
     going_to: str,
 ) -> float:
-    """
-    Penaliza curvas fortes.
-
-    Isto ajuda a escolher caminhos mais fluídos quando existem caminhos
-    com distância semelhante.
-    """
+    """Penaliza curvas fortes."""
     if came_from is None:
         return 0.0
 

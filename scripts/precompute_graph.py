@@ -40,7 +40,15 @@ def load_graph(yaml_path: Path) -> nx.Graph:
 
 
 def precompute(G: nx.Graph) -> dict:
-    """Pré-computa distâncias mínimas entre todos os pares de nós."""
+    """Pré-computa distâncias e features estruturais do grafo.
+
+    Devolve:
+      - shortest_distances: distâncias mínimas par-a-par.
+      - betweenness:        centralidade de cada nó (gargalo).
+      - degree:             grau (nº de vizinhos) por nó.
+      - dist_to_type:       distância mínima de cada nó ao tipo mais próximo,
+                            para tipos {exit, processA_entry, processB_entry}.
+    """
     nodes = list(G.nodes)
     n     = len(nodes)
     shortest_distances: dict = {}
@@ -48,6 +56,7 @@ def precompute(G: nx.Graph) -> dict:
     print(f"Grafo: {n} nós, {G.number_of_edges()} arestas")
     print()
 
+    # Distâncias par-a-par
     for i, src in enumerate(nodes):
         shortest_distances[src] = {}
         lengths = nx.single_source_dijkstra_path_length(G, src, weight="distance")
@@ -55,9 +64,41 @@ def precompute(G: nx.Graph) -> dict:
             shortest_distances[src][dst] = lengths.get(dst, float("inf"))
 
         if (i + 1) % 10 == 0 or i + 1 == n:
-            print(f"  [{i + 1:>3}/{n}] {src} ✓")
+            print(f"  [{i + 1:>3}/{n}] {src} OK")
 
-    return {"shortest_distances": shortest_distances}
+    # Betweenness centrality (normalizada [0, 1])
+    print("Calculando betweenness centrality...")
+    betweenness = nx.betweenness_centrality(G, weight="distance", normalized=True)
+
+    # Degree por nó
+    degree = {node: G.degree(node) for node in nodes}
+
+    # Distância ao tipo mais próximo (exit, processA_entry, processB_entry)
+    nodes_by_type: dict[str, list[str]] = {}
+    for node, attrs in G.nodes(data=True):
+        t = attrs.get("type", "")
+        nodes_by_type.setdefault(t, []).append(node)
+
+    target_types = ["exit", "processA_entry", "processB_entry"]
+    dist_to_type: dict[str, dict[str, float]] = {}
+    for node in nodes:
+        dist_to_type[node] = {}
+        for t in target_types:
+            candidates = nodes_by_type.get(t, [])
+            if not candidates:
+                dist_to_type[node][t] = float("inf")
+                continue
+            dist_to_type[node][t] = min(
+                shortest_distances[node].get(c, float("inf"))
+                for c in candidates
+            )
+
+    return {
+        "shortest_distances": shortest_distances,
+        "betweenness":        betweenness,
+        "degree":             degree,
+        "dist_to_type":       dist_to_type,
+    }
 
 
 def main() -> None:

@@ -1,38 +1,8 @@
-"""
-env/core/box_manager.py
-~~~~~~~~~~~~~~~~~~~~~~~
-Gestão do ciclo de vida das caixas no ambiente de fábrica.
+"""Gestão do ciclo de vida das caixas (criar, spawn, pick, drop, auto-advance).
 
-Responsabilidades
------------------
-  - Criar caixas no reset() com pipelines e waypoints aleatórios
-    gerados a partir do box_pipeline.yaml
-  - on_pick(robot, box_id)   — robot apanha caixa (chamado pelo env após
-                               decisão do agente RL)
-  - on_drop(robot, node)     — drop automático quando robot chega ao
-                               next_waypoint da caixa que transporta;
-                               devolve (reward, delivered, box_id)
-  - available_boxes()        — caixas disponíveis para assignment
-                               (filtra por capacidade do nó destino)
-  - tick_spawn()             — tenta colocar caixas da fila de espera
-                               quando o nó de entrada fica livre
-  - is_node_drop_available() — verifica capacidade (máx. 1 caixa por nó)
-
-Regra de capacidade
--------------------
-  Cada nó especial (entry, exit, processA_entry, processA_exit,
-  processB_entry, processB_exit) suporta no máximo 1 caixa.
-  Uma caixa ocupa um nó enquanto estiver WAITING.
-  Um nó também está "reservado" quando uma caixa IN_TRANSIT se dirige
-  para ele (next_waypoint) — evita que dois robots levem duas caixas
-  para o mesmo destino.
-
-Spawn lazy
-----------
-  As caixas são criadas no reset() mas não colocadas imediatamente.
-  São mantidas numa fila (_spawn_queue). Em cada tick, tick_spawn()
-  tenta colocar as caixas da fila nos nós de entrada livres.
-  Isto garante que nunca ficam 2 caixas no mesmo nó entry ao início.
+As caixas nascem só com pipeline + entry; o agent decide o próximo destino
+(next_waypoint) a cada drop intermédio. Pares process_entry/exit fazem
+auto-advance dentro do `apply_drop` da Box.
 """
 
 from __future__ import annotations
@@ -45,18 +15,10 @@ from typing import Optional
 from env.core.entities import Box, BoxStatus, PipelineType, Robot
 
 
-# ---------------------------------------------------------------------------
-# Rewards por evento de caixa
-# ---------------------------------------------------------------------------
+REWARD_WAYPOINT = 1.0
+REWARD_DELIVERY = 10.0
+REWARD_PICK     = 0.3
 
-REWARD_WAYPOINT = 1.0     # waypoint intermédio concluído
-REWARD_DELIVERY = 10.0    # entrega completa (exit node)
-REWARD_PICK     = 0.3     # pick bem-sucedido
-
-
-# ---------------------------------------------------------------------------
-# Mapeamento nome → enum
-# ---------------------------------------------------------------------------
 
 _PIPELINE_MAP: dict[str, PipelineType] = {
     "blue":  PipelineType.BLUE,
@@ -65,23 +27,8 @@ _PIPELINE_MAP: dict[str, PipelineType] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# BoxManager
-# ---------------------------------------------------------------------------
-
 class BoxManager:
-    """
-    Gere o ciclo de vida das caixas.
-
-    Não toma decisões de alocação — essa responsabilidade é do agente RL.
-    Expõe o estado das caixas e processa eventos de pick/drop.
-
-    Parâmetros
-    ----------
-    pipeline_path : caminho para box_pipeline.yaml
-    n_boxes       : número total de caixas no episódio
-    seed          : seed para reprodutibilidade (opcional)
-    """
+    """Gere ciclo de vida das caixas: spawn lazy, pick/drop, target options."""
 
     def __init__(
         self,
@@ -92,26 +39,14 @@ class BoxManager:
         self._pipeline_path = Path(pipeline_path)
         self._n_boxes       = n_boxes
         self._rng           = random.Random(seed)
-
         self._pipeline_cfg  = self._load_pipeline_cfg()
 
-        # Caixas activas (já colocadas no ambiente)
-        self._boxes   : dict[int, Box]  = {}
-        # Caixas em fila de espera (ainda não colocadas)
-        self._spawn_queue : list[Box]   = []
-        self._next_id : int = 0
-
-    # ------------------------------------------------------------------
-    # Ciclo de vida do episódio
-    # ------------------------------------------------------------------
+        self._boxes       : dict[int, Box] = {}
+        self._spawn_queue : list[Box]      = []
+        self._next_id     : int            = 0
 
     def reset(self, seed: Optional[int] = None) -> None:
-        """
-        Cria todas as caixas e tenta colocar as que cabem nos nós de entrada.
-
-        As restantes ficam em fila de espera (_spawn_queue) e são
-        colocadas à medida que os nós ficam livres via tick_spawn().
-        """
+        """Cria todas as caixas e activa as que cabem nas entries livres."""
         if seed is not None:
             self._rng = random.Random(seed)
 
@@ -119,7 +54,6 @@ class BoxManager:
         self._spawn_queue.clear()
         self._next_id = 0
 
-        # Recolhe todos os entries possíveis (iguais em todos os pipelines)
         all_entries: list[str] = []
         for cfg in self._pipeline_cfg.values():
             entries = [
@@ -130,8 +64,6 @@ class BoxManager:
                 all_entries = entries
                 break
 
-        # Atribui entries sem repetição quando n_boxes <= n_entries,
-        # garantindo que todas as caixas spawnham imediatamente
         if all_entries and len(all_entries) >= self._n_boxes:
             entry_pool = self._rng.sample(all_entries, self._n_boxes)
         elif all_entries:
@@ -144,24 +76,16 @@ class BoxManager:
             box = self._create_pending_box(forced_entry=forced_entry)
             self._spawn_queue.append(box)
 
-        # Coloca as que couberem imediatamente (com entries distintos, são todas)
         self.tick_spawn()
 
     def tick_spawn(self) -> list[int]:
-        """
-        Tenta colocar caixas da fila de espera nos nós de entrada livres.
-
-        Uma caixa só é activada se o seu nó de entrada (waypoints[0])
-        não tiver outra caixa WAITING nem uma caixa IN_TRANSIT a caminho.
-
-        Devolve lista de box_ids recém-colocados (pode ser vazia).
-        """
+        """Activa caixas da fila quando o entry está livre. Devolve novos ids."""
         newly_placed: list[int] = []
         still_waiting: list[Box] = []
 
         for box in self._spawn_queue:
-            entry = box.waypoints[0]
-            if self.is_node_drop_available(entry):
+            entry = box.current_node
+            if entry is not None and self.is_node_drop_available(entry):
                 self._boxes[box.box_id] = box
                 newly_placed.append(box.box_id)
             else:
@@ -170,19 +94,8 @@ class BoxManager:
         self._spawn_queue = still_waiting
         return newly_placed
 
-    # ------------------------------------------------------------------
-    # Capacidade de nós
-    # ------------------------------------------------------------------
-
     def is_node_drop_available(self, node: str) -> bool:
-        """
-        True se o nó pode receber uma nova caixa (regra: máx. 1 por nó).
-
-        Um nó está ocupado se:
-          - já tem uma caixa WAITING, OU
-          - uma caixa IN_TRANSIT tem esse nó como next_waypoint
-            (reservado por um robot que já está a caminho).
-        """
+        """True se o nó pode receber uma caixa (regra: máx. 1 por nó)."""
         for box in self._boxes.values():
             if box.is_waiting and box.current_node == node:
                 return False
@@ -190,22 +103,15 @@ class BoxManager:
                 return False
         return True
 
-    # ------------------------------------------------------------------
-    # Eventos de pick / drop  (chamados pelo FactoryEnv)
-    # ------------------------------------------------------------------
-
     def on_pick(self, robot: Robot, box_id: int) -> float:
-        """
-        Regista que o robot apanhou a caixa.
-
-        Devolve reward de pick, ou 0.0 se o pick falhou.
-        """
+        """Regista pickup; devolve REWARD_PICK ou 0.0 se falhou."""
         box = self._boxes.get(box_id)
-        if box is None:
-            return 0.0
-        if not box.is_available:
+        if box is None or not box.is_available:
             return 0.0
         if box.current_node != robot.current_node:
+            return 0.0
+        # Sem next_waypoint definido o agent ainda não escolheu destino → não pick.
+        if box.next_waypoint is None:
             return 0.0
 
         box.pick_up(robot.id)
@@ -213,21 +119,7 @@ class BoxManager:
         return REWARD_PICK
 
     def on_drop(self, robot: Robot, node: str) -> tuple[float, bool, int | None]:
-        """
-        Tenta fazer drop da caixa que o robot transporta.
-
-        Só faz drop se o nó for o next_waypoint da caixa.
-
-        Se o drop ocorrer num processX_entry com par auto_advance, a caixa
-        avança instantaneamente para o processX_exit emparelhado (se livre).
-        A recompensa só é atribuída pelo drop manual — o auto-advance é
-        uma acção do ambiente, não do agente.
-
-        Devolve (reward, delivered, box_id).
-          reward    : reward do evento (waypoint ou entrega)
-          delivered : True se foi entrega final
-          box_id    : id da caixa envolvida, ou None se não houve drop
-        """
+        """Tenta drop no nó; devolve (reward, delivered, box_id)."""
         if robot.carrying_box is None:
             return 0.0, False, None
 
@@ -240,76 +132,16 @@ class BoxManager:
             return 0.0, False, None
 
         box_id    = box.box_id
-        delivered = box.advance_waypoint(node)
+        delivered = box.apply_drop(node)
         robot.carrying_box = None
 
         reward = REWARD_DELIVERY if delivered else REWARD_WAYPOINT
-
-        # Auto-advance através de estações de processamento.
-        # Se o par exit estiver ocupado, a caixa fica WAITING no entry
-        # e tick_process_advance() tentará de novo nos ticks seguintes.
-        if not delivered:
-            self._try_auto_advance(box)
-
         return reward, delivered, box_id
 
-    def tick_process_advance(self) -> list[int]:
-        """
-        Polling: tenta avançar caixas paradas em waypoints com auto_advance
-        para o waypoint seguinte (par de processo), quando o destino estiver
-        livre.
-
-        Útil quando o exit estava ocupado no momento do drop e ficou livre
-        mais tarde (e.g. outro robot apanhou a caixa de lá).
-
-        Devolve box_ids que avançaram neste tick.
-        """
-        advanced: list[int] = []
-        for box in self._boxes.values():
-            if not box.is_waiting:
-                continue
-            current_idx = box.waypoint_idx - 1
-            if current_idx not in box.auto_advance_indices:
-                continue
-            before = box.current_node
-            self._try_auto_advance(box)
-            if box.current_node != before:
-                advanced.append(box.box_id)
-        return advanced
-
-    def _try_auto_advance(self, box: Box) -> bool:
-        """
-        Avança automaticamente a caixa enquanto o waypoint actual estiver
-        marcado em auto_advance_indices e o destino seguinte estiver livre.
-
-        Devolve True se a caixa ficou entregue (improvável aqui — não há
-        pares em que o segundo elemento seja o exit final).
-        """
-        while True:
-            current_idx = box.waypoint_idx - 1
-            if current_idx not in box.auto_advance_indices:
-                return False
-            next_wp = box.next_waypoint
-            if next_wp is None:
-                return False
-            if not self.is_node_drop_available(next_wp):
-                # Destino bloqueado — caixa fica no entry e tenta-se de novo
-                # em tick_process_advance() quando o destino libertar.
-                return False
-            delivered = box.advance_waypoint(next_wp)
-            if delivered:
-                return True
-
-    # ------------------------------------------------------------------
-    # Consultas de estado  (usadas pelo agente RL e pelo FactoryEnv)
-    # ------------------------------------------------------------------
-
     def get_box(self, box_id: int) -> Box | None:
-        """Devolve a caixa activa pelo id, ou None."""
         return self._boxes.get(box_id)
 
     def boxes(self) -> list[Box]:
-        """Todas as caixas activas (qualquer estado)."""
         return list(self._boxes.values())
 
     def active_boxes(self) -> list[Box]:
@@ -317,154 +149,89 @@ class BoxManager:
         return [b for b in self._boxes.values() if not b.is_done]
 
     def available_boxes(self) -> list[Box]:
-        """
-        Caixas disponíveis para assignment pelo agente RL.
+        """Caixas WAITING (assignable pelo agente).
 
-        Uma caixa está disponível se:
-          - status == WAITING e não está a ser transportada
-          - tem um next_waypoint definido
-          - o next_waypoint tem capacidade livre (nenhuma outra caixa lá
-            ou a caminho) — regra de 1 caixa por nó
+        Inclui boxes com next_waypoint ainda por decidir — é trabalho do agent
+        decidir o destino. Filtra boxes sem opções (DONE).
         """
         return [
             b for b in self._boxes.values()
-            if b.is_available
-            and b.next_waypoint is not None
-            and self.is_node_drop_available(b.next_waypoint)
+            if b.is_available and b.target_options()
         ]
 
     def available_boxes_at(self, node: str) -> list[Box]:
-        """
-        Caixas WAITING num nó específico.
-
-        Usado apenas para features do GNN (n_boxes_waiting),
-        sem verificar capacidade do destino.
-        """
+        """Caixas WAITING num nó (para features do agente)."""
         return [
             b for b in self._boxes.values()
             if b.is_available and b.current_node == node
         ]
 
-    def box_carried_by(self, robot_id: str) -> Box | None:
-        """Devolve a caixa transportada por um robot, ou None."""
-        for box in self._boxes.values():
-            if box.carried_by == robot_id:
-                return box
-        return None
-
     def delivered_count(self) -> int:
         return sum(1 for b in self._boxes.values() if b.is_done)
 
     def queue_count(self) -> int:
-        """Número de caixas ainda em fila de espera (não colocadas)."""
+        """Número de caixas ainda em fila de espera."""
         return len(self._spawn_queue)
 
     def all_delivered(self) -> bool:
-        """
-        True quando todas as caixas foram entregues E a fila de espera
-        está vazia (não há mais caixas a spawnar).
-        """
+        """True quando todas entregues E spawn_queue vazia."""
         return (
             not self._spawn_queue
             and all(b.is_done for b in self._boxes.values())
         )
 
     def snapshot(self) -> list[dict]:
-        """Estado completo das caixas activas — para observação e debug."""
+        """Estado das caixas activas para observação/debug."""
         return [
             {
-                "box_id":        b.box_id,
-                "pipeline":      b.pipeline.name,
-                "status":        b.status.name,
-                "current_node":  b.current_node,
-                "next_waypoint": b.next_waypoint,
-                "carried_by":    b.carried_by,
-                "waypoint_idx":  b.waypoint_idx,
-                "n_waypoints":   len(b.waypoints),
-                "waypoints":     b.waypoints,
+                "box_id":            b.box_id,
+                "pipeline":          b.pipeline.name,
+                "status":            b.status.name,
+                "current_node":      b.current_node,
+                "next_waypoint":     b.next_waypoint,
+                "carried_by":        b.carried_by,
+                "target_options":    b.target_options(),
+                "steps_done":        b.steps_done,
+                "steps_total":       b.pipeline_total_steps,
+                "pipeline_remaining": list(b.pipeline_remaining),
             }
             for b in self._boxes.values()
         ]
 
-    # ------------------------------------------------------------------
-    # Internos — criação de caixas
-    # ------------------------------------------------------------------
-
     def _create_pending_box(self, forced_entry: str | None = None) -> Box:
-        """
-        Cria uma caixa com pipeline e waypoints já determinados,
-        mas sem a colocar no ambiente (fica em fila de espera).
-        """
+        """Cria caixa com pipeline; só fixa o entry, restantes fases são decisão do agent."""
         pipeline_name = self._rng.choice(list(self._pipeline_cfg.keys()))
         pipeline_type = _PIPELINE_MAP[pipeline_name]
         cfg           = self._pipeline_cfg[pipeline_name]
-        waypoints, auto_advance_indices = self._build_waypoints(
-            cfg, forced_entry=forced_entry,
+
+        constraints: dict[str, list] = cfg.get("constraints", {})
+        sequence    : list[str]      = list(cfg.get("sequence", []))
+
+        # Escolhe o entry (forçado ou aleatório das opções).
+        entry_opts = [o for o in constraints.get("entry", []) if isinstance(o, str)]
+        entry_node = (
+            forced_entry if forced_entry is not None and forced_entry in entry_opts
+            else (self._rng.choice(entry_opts) if entry_opts else None)
         )
+
+        # pipeline_remaining = todos os steps menos "entry" (que já está fixo).
+        pipeline_remaining = [s for s in sequence if s != "entry"]
 
         box = Box(
             box_id               = self._next_id,
             pipeline             = pipeline_type,
-            waypoints            = waypoints,
-            current_node         = waypoints[0],
+            current_node         = entry_node,
+            pipeline_remaining   = pipeline_remaining,
+            pipeline_constraints = constraints,
+            pipeline_total_steps = len(pipeline_remaining),
             status               = BoxStatus.WAITING,
-            auto_advance_indices = auto_advance_indices,
         )
         self._next_id += 1
         return box
 
-    def _build_waypoints(
-        self,
-        cfg          : dict,
-        forced_entry : str | None = None,
-    ) -> tuple[list[str], set[int]]:
-        """
-        Constrói a lista de waypoints para uma pipeline e o conjunto de
-        índices que devem fazer auto-advance.
-
-        cfg["sequence"]    → ordem dos passos (ex: ["entry","processA","exit"])
-        cfg["constraints"] → passo → lista de opções
-        forced_entry       → se definido, usa este nó como entry em vez de sortear
-
-        Cada opção pode ser:
-          - str  → nó único  (ex: "entryA")
-          - list → par de nós para uma estação de processo
-                   (ex: ["processA1_entry","processA1_exit"])
-                   Os dois nós são adicionados como waypoints consecutivos
-                   e o primeiro fica marcado como auto-advance (o processo
-                   transfere a caixa internamente do entry para o exit).
-        """
-        waypoints: list[str] = []
-        auto_advance_indices: set[int] = set()
-        constraints: dict[str, list] = cfg.get("constraints", {})
-
-        for step in cfg.get("sequence", []):
-            options = constraints.get(step, [])
-            if not options:
-                continue
-            if step == "entry" and forced_entry is not None:
-                choice = forced_entry
-            else:
-                choice = self._rng.choice(options)
-            if isinstance(choice, list):
-                # Par (entry + exit) de uma estação de processo.
-                # Marca o entry para auto-advance instantâneo até ao exit.
-                entry_idx = len(waypoints)
-                waypoints.extend(choice)
-                auto_advance_indices.add(entry_idx)
-            else:
-                waypoints.append(choice)
-
-        return waypoints, auto_advance_indices
-
-    # ------------------------------------------------------------------
-    # Internos — carregamento do yaml
-    # ------------------------------------------------------------------
-
     def _load_pipeline_cfg(self) -> dict:
         with open(self._pipeline_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-
         pipelines = data.get("pipelines", {})
         return {
             name: cfg

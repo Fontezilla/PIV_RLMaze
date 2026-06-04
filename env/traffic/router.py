@@ -34,15 +34,7 @@ PARKED_EDGE_CONGESTION_PENALTY = 2500.0
 
 
 class Router:
-    """
-    Controlo de tráfego reactivo:
-      - A* no grafo dinâmico
-      - Locks de segmento e nó
-      - Penalização anti-loop
-      - Waiting inteligente com limite de tempo (evita livelocks)
-      - Evasão para nós especiais
-      - Parking goal-aligned em subnós geométricos
-    """
+    """Controlo de tráfego reactivo:"""
 
     def __init__(self, graph: FactoryGraph) -> None:
         self.graph = graph
@@ -50,21 +42,49 @@ class Router:
         self.node_lock = NodeLock()
         self.parking_lock = ParkingLock()
         self._plans: dict[str, list[str]] = {}
+        # Cache de congestionamento: calculado uma vez por tick por robot_id,
+        # evita N chamadas a build_future_edge_usage por tick (N = n_robots).
+        self._congestion_cache: dict[str, dict[tuple[str, str], float]] = {}
 
     def reset(self) -> None:
         self.segment_lock = SegmentLock()
         self.node_lock = NodeLock()
         self.parking_lock = ParkingLock()
         self._plans.clear()
+        self._congestion_cache.clear()
 
-    # ------------------------------------------------------------------
-    # API principal
-    # ------------------------------------------------------------------
+    def begin_tick(self) -> None:
+        """Limpa o cache de congestionamento. Chamar no início de cada tick.
 
+        Dentro de um tick, o congestionamento de um robot é calculado uma vez
+        e reutilizado nas chamadas subsequentes (_replan + _compute_alt_plan).
+        """
+        self._congestion_cache.clear()
     def register(self, robot: Robot) -> None:
         if robot.current_node:
             self.node_lock.try_acquire(robot.current_node, robot.id)
             robot.push_visited(robot.current_node)
+
+    def peek_plan(self, robot_id: str, k_steps: int = 5) -> list[str]:
+        """Devolve os próximos K nodes do plan do robot (a partir do current_node).
+
+        Usado pelo agent para ter visibilidade das rotas planeadas dos outros
+        robots e coordenar espacialmente (evitar mandar 2 robots pelo mesmo
+        corredor).
+        """
+        plan = self._plans.get(robot_id, [])
+        if not plan:
+            return []
+        # plan[0] tipicamente é o current_node — skip e devolve os próximos.
+        return list(plan[1:1 + max(k_steps, 0)])
+
+    def find_parking_spec(self, robot: Robot, robots: list[Robot]) -> str | None:
+        """Procura parking spec 'u|v|fraction' para um robot IDLE blocking.
+
+        Usado pelo env para auto-park sem decisão do agent. Devolve None se
+        não houver spot seguro disponível.
+        """
+        return self._find_parking(robot, robots)
 
     def decide(self, robot: Robot, robots: list[Robot]) -> tuple[str, str | None] | None:
         if robot.goal_node is None:
@@ -157,11 +177,6 @@ class Router:
 
     def parked(self, robot: Robot, u: str, v: str, fraction: float) -> None:
         robot.parked_at = (u, v, fraction)
-        robot.parking_reserved_edge = (u, v)
-
-        # O robot está num ponto geométrico da aresta, não num nó real.
-        # Libertar o nó de origem evita que o parking continue a bloquear
-        # o próprio nó que queria libertar.
         self.node_lock.release(u, robot.id)
         self.segment_lock.release(u, v, robot.id)
         self.parking_lock.try_acquire(u, v, fraction, robot.id)
@@ -172,7 +187,6 @@ class Router:
         robot.progress = fraction
         robot.speed = 0.0
         robot.state = RobotState.PARKED
-        robot.parked_ticks = 0
 
         robot.push_edge(u, v)
 
@@ -182,8 +196,6 @@ class Router:
             self.parking_lock.release(u, v, fraction, robot.id)
 
         robot.parked_at = None
-        robot.parking_reserved_edge = None
-        robot.parked_ticks = 0
 
     def release_all(self, robot: Robot) -> None:
         if robot.current_node:
@@ -200,11 +212,6 @@ class Router:
         for robot in robots:
             if robot.state == RobotState.MOVING and robot.from_node is not None:
                 self.node_lock.release(robot.from_node, robot.id)
-
-    # ------------------------------------------------------------------
-    # Planeamento
-    # ------------------------------------------------------------------
-
     def _has_valid_plan(self, robot: Robot) -> bool:
         robot_plan = self._plans.get(robot.id, [])
         if len(robot_plan) < 2:
@@ -216,16 +223,7 @@ class Router:
         robot  : Robot,
         robots : list[Robot] | None = None,
     ) -> list[str] | None:
-        """
-        Executa A* com bloqueios e penalizações. Devolve o caminho ou None.
-        Partilhado por _replan (que guarda o resultado) e _compute_alt_plan
-        (que apenas estima o custo sem guardar).
-
-        Parked edges are NOT hard-blocked here — they're penalised via
-        congested_edges so A* routes around them when alternatives exist.
-        Hard-blocking parked junction edges causes cascade deadlocks when
-        multiple corridors are simultaneously occupied.
-        """
+        """Executa A* com bloqueios e penalizações. Devolve o caminho ou None."""
         if robot.current_node is None or robot.goal_node is None:
             return None
 
@@ -319,15 +317,17 @@ class Router:
             return robot_plan[1]
         return None
 
+    def next_planned_node(self, robot_id: str) -> str | None:
+        """Próximo nó do plano actual do robot (após o current_node), ou None."""
+        robot_plan = self._plans.get(robot_id, [])
+        if len(robot_plan) >= 2:
+            return robot_plan[1]
+        return None
+
     def _advance_plan(self, robot: Robot) -> None:
         robot_plan = self._plans.get(robot.id, [])
         if robot_plan:
             self._plans[robot.id] = robot_plan[1:]
-
-    # ------------------------------------------------------------------
-    # Waiting inteligente
-    # ------------------------------------------------------------------
-
     def _ideal_next_node(self, robot: Robot) -> str | None:
         """Próximo nó no caminho ideal sem bloqueios."""
         if robot.current_node is None or robot.goal_node is None:
@@ -348,22 +348,7 @@ class Router:
     def _estimate_ticks_to_free(
         self, node: str, robots: list[Robot]
     ) -> int | None:
-        """
-        Estima em quantos ticks o nó ficará livre. Lookahead de 2 passos.
-
-        Caso 1 — robot em trânsito direto (to_node == node, MOVING):
-            ticks = restante_da_aresta + saída_mínima_do_nó
-
-        Caso 2 — robot já no nó, parado (IDLE/WAITING):
-            ticks = saída_mínima_do_nó
-            EXCEPÇÃO: se esse robot também está em WAITING há muitos ticks,
-            provavelmente também está bloqueado — não contar como "vai libertar".
-
-        Caso 3 — lookahead: robot a 1 passo (to_node vizinho de node):
-            ticks = restante_até_to_node + tempo(to_node→node) + saída_de_node
-
-        Retorna None se ninguém vai libertar o nó.
-        """
+        """Estima em quantos ticks o nó ficará livre. Lookahead de 2 passos."""
         for other in robots:
             # Caso 1: em trânsito direto
             if other.to_node == node and other.state == RobotState.MOVING:
@@ -446,13 +431,18 @@ class Router:
         robot: Robot,
         robots: list[Robot] | None,
     ) -> dict[tuple[str, str], float]:
-        """
-        Cria penalizações suaves para arestas que provavelmente vão ser usadas.
+        """Cria penalizações suaves para arestas que provavelmente vão ser usadas.
 
-        Não bloqueia a rota: apenas torna menos atractivos caminhos que cruzam
-        trajectórias previstas ou arestas com robots estacionados.
+        O resultado é cacheado por robot_id durante o tick (ver begin_tick).
+        Assim build_future_edge_usage é chamado no máximo 1x por robot por tick,
+        mesmo que _replan e _compute_alt_plan sejam invocados para o mesmo robot.
         """
+        cached = self._congestion_cache.get(robot.id)
+        if cached is not None:
+            return cached
+
         if not robots:
+            self._congestion_cache[robot.id] = {}
             return {}
 
         congested: dict[tuple[str, str], float] = {}
@@ -476,12 +466,8 @@ class Router:
                 PARKED_EDGE_CONGESTION_PENALTY,
             )
 
+        self._congestion_cache[robot.id] = congested
         return congested
-
-    # ------------------------------------------------------------------
-    # Movimento
-    # ------------------------------------------------------------------
-
     def _try_move(self, robot: Robot, next_node: str) -> bool:
         if robot.current_node is None:
             return False
@@ -502,11 +488,6 @@ class Router:
 
         self._advance_plan(robot)
         return True
-
-    # ------------------------------------------------------------------
-    # Evasão
-    # ------------------------------------------------------------------
-
     def _find_evasion(self, robot: Robot, robots: list[Robot]) -> str | None:
         if robot.current_node is None:
             return None
@@ -537,16 +518,21 @@ class Router:
             if rid != robot_id:
                 nodes.update(path)
         return nodes
-
-    # ------------------------------------------------------------------
-    # Decisão WAITING vs PARKING
-    # ------------------------------------------------------------------
-
     def _should_try_parking(self, robot: Robot, robots: list[Robot]) -> bool:
         if robot.current_node is None:
             return False
 
         if self._is_deadlock(robot):
+            return True
+
+        # Priority awareness: se este robot tem priority baixa e algum robot
+        # WAITING perto tem priority maior, parka mais cedo (cede a quem carrega
+        # algo mais valioso).
+        max_waiting_priority = max(
+            (r.priority for r in robots if r.state == RobotState.WAITING and r.id != robot.id),
+            default=0.0,
+        )
+        if max_waiting_priority > robot.priority and robot.wait_ticks_in_junction >= 2:
             return True
 
         # Se outro robot precisa deste nó, ainda assim damos alguns ticks
@@ -567,10 +553,7 @@ class Router:
         return WAIT_LIMIT_NORMAL_NODE
 
     def _current_node_needed_by_other(self, robot: Robot, robots: list[Robot]) -> bool:
-        """
-        True se o nó actual do robot aparece como necessidade provável
-        de outro robot nos próximos passos.
-        """
+        """True se o nó actual do robot aparece como necessidade provável."""
         node = robot.current_node
         if node is None:
             return False
@@ -589,28 +572,7 @@ class Router:
             if node in other_plan[1:LOOKAHEAD_STEPS + 1]:
                 return True
 
-            if other.current_node is None or other.goal_node is None:
-                continue
-
-            try:
-                predicted_path = plan(
-                    graph=self.graph,
-                    src=other.current_node,
-                    dst=other.goal_node,
-                    came_from=other.came_from,
-                )
-            except Exception:
-                predicted_path = None
-
-            if predicted_path and node in predicted_path[1:LOOKAHEAD_STEPS + 1]:
-                return True
-
         return False
-
-    # ------------------------------------------------------------------
-    # Deadlock
-    # ------------------------------------------------------------------
-
     def _is_deadlock(self, robot: Robot) -> bool:
         return robot.wait_ticks_in_junction >= DEADLOCK_THRESHOLD
 
@@ -653,18 +615,8 @@ class Router:
             return max(int(dist / max(MAX_SPEED, 1)), 1)
         except Exception:
             return 20
-
-    # ------------------------------------------------------------------
-    # Parking
-    # ------------------------------------------------------------------
-
     def _find_parking(self, robot: Robot, robots: list[Robot]) -> str | None:
-        """
-        Escolhe parking através do módulo de previsão.
-
-        A reserva fica feita aqui para evitar que outro robot escolha o mesmo
-        segmento/ponto no mesmo tick.
-        """
+        """Escolhe parking através do módulo de previsão."""
         candidate = find_safe_parking_candidate(
             graph=self.graph,
             robot=robot,
@@ -689,12 +641,7 @@ class Router:
         return f"{u}|{v}|{fraction}"
 
     def _unpark_target(self, robot: Robot, robots: list[Robot]) -> str | None:
-        """
-        Escolhe o melhor extremo da aresta de parking.
-
-        Em vez de obrigar o robot a voltar ao nó de origem, compara os dois
-        extremos da aresta e escolhe o que reduz mais o custo até ao objectivo.
-        """
+        """Escolhe o melhor extremo da aresta de parking."""
         if not robot.parked_at or not robot.goal_node:
             return None
 

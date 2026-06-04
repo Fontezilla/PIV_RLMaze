@@ -18,12 +18,13 @@ agent:
 train:
   n_workers         : 4      # ambientes em paralelo (1 = sem paralelismo)
   n_episodes        : 2000   # episódios de treino total
-  lr                : 3.0e-4
+  lr                : 1.0e-4
   gamma             : 0.99
   lam               : 0.95   # GAE lambda
   clip_eps          : 0.2    # PPO clipping
   value_coef        : 0.5
-  entropy_coef      : 0.01
+  entropy_coef_start: 0.05    # exploração inicial — policy ainda aleatória
+  entropy_coef_end  : 0.01    # valor final — policy já converge
   n_epochs          : 1      # épocas PPO por update (com n_workers=4 já tens 4x mais dados)
   max_grad_norm     : 0.5
   normalize_advantages: true

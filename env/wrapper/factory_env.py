@@ -1,46 +1,4 @@
-"""
-env/wrapper/factory_env.py
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-Orquestrador do ambiente de fábrica v0.7.
-
-Arquitectura
-------------
-  env/core/   ←  World, Robot, Box, BoxManager, physics
-  env/traffic/ ←  Router
-       ↑
-  FactoryEnv  (este ficheiro)
-
-Responsabilidades
------------------
-  - Correr a simulação tick a tick
-  - Detectar eventos que requerem decisão do agente RL:
-      * robot ficou livre (chegou ao goal sem caixa, ou pre-posição vazia)
-      * nova caixa disponível → re-decide robots IDLE/WAITING sem caixa
-  - Executar assignments decididos pelo agente: {robot_id: target}
-      target = box_id (int)  →  robot vai buscar a caixa
-      target = node_id (str) →  robot vai para nó de pre-posição
-  - Acumular reward entre eventos e devolvê-lo no step()
-  - Expor estado bruto para o agente construir o HeteroGraph
-
-Interface com o agente RL
--------------------------
-  O agente RL recebe um dict com o estado do mundo e decide assignments.
-  O FactoryEnv não constrói observações — isso é responsabilidade do agente.
-
-  Loop típico de treino:
-
-    state, info = env.reset()
-    done = False
-    while not done:
-        assignments = agent.decide(state)        # {robot_id: target}
-        state, reward, terminated, truncated, info = env.step(assignments)
-        done = terminated or truncated
-
-Terminated / Truncated
------------------------
-  terminated : True quando todas as caixas foram entregues
-  truncated  : True quando world.tick >= tick_limit
-"""
+"""Orquestrador do ambiente de fábrica — corre simulação e expõe estado ao agente RL."""
 
 from __future__ import annotations
 
@@ -48,48 +6,35 @@ import random
 from pathlib import Path
 from typing import Optional
 
-from env.core.entities import Robot, RobotState
+from env.core.entities import Box, Robot, RobotState
 from env.core.graph import FactoryGraph
 from env.core.physics import MAX_SPEED, tick as physics_tick, turn_delay
 from env.core.world import World
-from env.core.box_manager import BoxManager, REWARD_PICK
+from env.core.box_manager import BoxManager
 from env.traffic.router import Router, DEADLOCK_THRESHOLD
 
-
-# ---------------------------------------------------------------------------
-# Constantes
-# ---------------------------------------------------------------------------
 
 SPAWN_NODE    = "N"
 SPAWN_STAGGER = 10
 TICK_LIMIT    = 5_000
 
-REWARD_PER_TICK  = -0.001   # custo de tempo por robot activo por tick
-REWARD_DEADLOCK  = -0.5     # penalização por deadlock detectado
-REWARD_WAITING   = -0.02    # penalização por tick em WAITING
+REWARD_PER_TICK     = -0.001
+REWARD_DEADLOCK     = -0.5
+REWARD_WAITING      = -0.02
+REWARD_IDLE         = -0.005
+# Distribuição: bónus por entregar num exit pouco usado, penalty se já saturado.
+REWARD_DISTRIBUTION = 2.0
+# Penalty quando o agent muda de assignment a meio do trajeto (anti-thrashing).
+REWARD_ABORT        = -0.5
 
-# Nós candidatos a pre-posição — onde caixas vão aparecer ou chegar
-# Inclui processA_exit e processB_exit porque são agora waypoints reais
-# onde caixas ficam WAITING após processamento.
-_PREPOSITION_TYPES = frozenset({
-    "entry",
-    "exit",
-    "processA_entry",
-    "processA_exit",
-    "processB_entry",
-    "processB_exit",
-})
 
 DEFAULT_MAP      = Path(".configs/map_factory.yaml")
 DEFAULT_CACHE    = Path(".configs/graph_cache.pkl")
 DEFAULT_PIPELINE = Path(".configs/box_pipeline.yaml")
 
 
-# ---------------------------------------------------------------------------
-# Helpers de despacho  (idênticos à versão anterior)
-# ---------------------------------------------------------------------------
-
 def _dispatch_move(robot: Robot, next_node: str, graph: FactoryGraph) -> None:
+    """Despacha um robot para se mover para `next_node`."""
     delay = (
         turn_delay(graph, robot.came_from, robot.current_node, next_node)
         if robot.current_node else 0
@@ -108,6 +53,7 @@ def _dispatch_move(robot: Robot, next_node: str, graph: FactoryGraph) -> None:
 
 
 def _dispatch_park(robot: Robot, park_spec: str, router: Router) -> None:
+    """Despacha um robot para parking point geométrico u|v|fraction."""
     u, v, frac_str = park_spec.split("|")
     fraction = float(frac_str)
     robot.from_node              = u
@@ -128,6 +74,7 @@ def _dispatch_unpark(
     target_node : str | None,
     router      : Router,
 ) -> None:
+    """Tira o robot do parking em direcção a `target_node`."""
     if robot.parked_at is None:
         return
     u, v, frac = robot.parked_at
@@ -155,28 +102,8 @@ def _dispatch_unpark(
     router.unparked(robot)
 
 
-# ---------------------------------------------------------------------------
-# FactoryEnv
-# ---------------------------------------------------------------------------
-
 class FactoryEnv:
-    """
-    Orquestrador do ambiente de fábrica.
-
-    Não é um gym.Env directamente — o wrapper gym fica na camada do agente RL
-    para suportar espaços de observação/acção variáveis (HeteroGraph).
-
-    Parâmetros
-    ----------
-    n_robots      : número de robots activos em simultâneo
-    n_boxes       : número de caixas criadas no reset()
-    tick_limit    : ticks máximos antes de truncation
-    map_path      : caminho para map_factory.yaml
-    cache_path    : caminho para graph_cache.pkl
-    pipeline_path : caminho para box_pipeline.yaml
-    render_mode   : "human" para pygame, None para headless
-    seed          : seed para reprodutibilidade
-    """
+    """Orquestrador do ambiente da fábrica (sim tick-a-tick + estado RL)."""
 
     def __init__(
         self,
@@ -193,16 +120,32 @@ class FactoryEnv:
         self.n_boxes     = n_boxes
         self.tick_limit  = tick_limit
         self.render_mode = render_mode
-        self._seed       = seed
         self._rng        = random.Random(seed)
 
         self.graph = FactoryGraph(str(map_path), str(cache_path))
 
-        # Nós de pre-posição expostos ao agente
-        self.preposition_nodes: list[str] = sorted(
-            n for n in self.graph.all_nodes()
-            if self.graph.node_type(n) in _PREPOSITION_TYPES
-        )
+        # ── Caches imutáveis (topologia não muda entre episódios) ──────────
+        # _graph_edge_features: lista completa, calculada uma vez.
+        self._cached_graph_edges: list[dict] = [
+            {"from": u, "to": v, "distance": data.get("distance", 1.0)}
+            for u, v, data in self.graph.graph.edges(data=True)
+        ]
+        # _graph_node_features: partes estáticas por nó (type, pos, betweenness…).
+        # Só n_robots_here e n_boxes_waiting são dinâmicas e calculadas por step.
+        self._cached_node_static: dict[str, dict] = {}
+        for _n in self.graph.all_nodes():
+            _x, _y = self.graph.node_position(_n)
+            _d2t   = self.graph.dist_to_type.get(_n, {})
+            self._cached_node_static[_n] = {
+                "type":            self.graph.node_type(_n),
+                "x":               _x,
+                "y":               _y,
+                "betweenness":     self.graph.betweenness.get(_n, 0.0),
+                "degree":          self.graph.degree_cache.get(_n, 1),
+                "dist_to_exit":    _d2t.get("exit",            float("inf")),
+                "dist_to_processA":_d2t.get("processA_entry",  float("inf")),
+                "dist_to_processB":_d2t.get("processB_entry",  float("inf")),
+            }
 
         self._box_manager = BoxManager(
             pipeline_path = pipeline_path,
@@ -210,33 +153,19 @@ class FactoryEnv:
             seed          = seed,
         )
 
-        # Estado da simulação (populado no reset)
         self.world        : World  | None = None
         self.router       : Router | None = None
         self._spawn_ticks : list[int]     = []
         self._robots_list : list[Robot]   = []
-
-        # Robots que aguardam decisão do agente neste momento
         self._pending_robots: list[Robot] = []
-
-        # Renderer lazy
         self._renderer = None
-
-    # ------------------------------------------------------------------
-    # API principal
-    # ------------------------------------------------------------------
 
     def reset(
         self,
         seed    : Optional[int]  = None,
         options : Optional[dict] = None,
     ) -> tuple[dict, dict]:
-        """
-        Reinicia o episódio.
-
-        Devolve (state, info) onde state é o estado bruto do mundo
-        para o agente construir o HeteroGraph.
-        """
+        """Reinicia o episódio; devolve (state, info)."""
         if seed is not None:
             self._rng = random.Random(seed)
 
@@ -249,7 +178,6 @@ class FactoryEnv:
         self._robots_list   = [Robot(id=f"robot_{i}") for i in range(self.n_robots)]
         self._pending_robots = []
 
-        # Corre ticks até haver robots spawnados e prontos para decisão
         self._run_until_decision_needed(accumulate_reward=False)
 
         state = self._build_state()
@@ -258,40 +186,16 @@ class FactoryEnv:
 
     def step(
         self,
-        assignments: dict[str, int | str],
+        assignments: dict[str, tuple[int, str] | None],
     ) -> tuple[dict, float, bool, bool, dict]:
-        """
-        Executa os assignments decididos pelo agente e avança a simulação
-        até ao próximo evento de decisão.
-
-        Parâmetros
-        ----------
-        assignments : {robot_id: target}
-            target = box_id (int)   → robot vai buscar a caixa
-            target = node_id (str)  → robot vai para nó de pre-posição
-
-        Devolve
-        -------
-        state      : estado bruto do mundo
-        reward     : reward acumulado desde o último step
-        terminated : todas as caixas entregues
-        truncated  : tick_limit atingido
-        info       : snapshot para debug
-        """
+        """Aplica assignments e avança até ao próximo evento de decisão."""
         assert self.world  is not None, "Chama reset() antes de step()."
         assert self.router is not None
 
-        # 1. Executa assignments sequencialmente
-        #    (a ordem é a de self._pending_robots, decidida pelo env)
         reward = self._apply_assignments(assignments)
-
-        # 2. Limpa lista de pendentes
         self._pending_robots.clear()
-
-        # 3. Corre ticks até próximo evento
         reward += self._run_until_decision_needed(accumulate_reward=True)
 
-        # 4. Terminação
         terminated = self._box_manager.all_delivered()
         truncated  = self.world.tick >= self.tick_limit
 
@@ -303,40 +207,15 @@ class FactoryEnv:
 
         return state, float(reward), terminated, truncated, info
 
-    # ------------------------------------------------------------------
-    # Estado exposto ao agente
-    # ------------------------------------------------------------------
-
-    def pending_robots(self) -> list[Robot]:
-        """Robots que aguardam assignment neste momento."""
-        return list(self._pending_robots)
-
-    def available_boxes(self):
-        """Caixas disponíveis para assignment."""
-        return self._box_manager.available_boxes()
-
-    # ------------------------------------------------------------------
-    # Internos — loop de simulação
-    # ------------------------------------------------------------------
-
     def _run_until_decision_needed(
         self,
         accumulate_reward: bool = True,
     ) -> float:
-        """
-        Corre ticks até haver pelo menos um robot a precisar de decisão,
-        ou até terminação.
-
-        Devolve reward acumulado durante os ticks.
-        """
+        """Corre ticks até haver robots pendentes ou terminação."""
         reward = 0.0
-
         while True:
-            # Condição de saída: há robots pendentes
             if self._pending_robots:
                 break
-
-            # Condição de saída: episódio terminado
             if self._box_manager.all_delivered():
                 break
             if self.world.tick >= self.tick_limit:
@@ -348,35 +227,33 @@ class FactoryEnv:
 
             if self.render_mode == "human":
                 self._do_render()
-
         return reward
 
     def _tick(self) -> float:
-        """Avança um tick da simulação. Devolve reward do tick."""
+        """Avança um tick da simulação; devolve o reward do tick."""
         assert self.world  is not None
         assert self.router is not None
 
         self.world.step_tick()
+        self.router.begin_tick()   # limpa cache de congestionamento do tick anterior
         reward = 0.0
 
-        # 1. Spawn de robots
         self._maybe_spawn_robots()
-
-        # 1b. Spawn de caixas (lazy — só coloca se o nó de entrada estiver livre)
         newly_spawned = self._box_manager.tick_spawn()
 
-        # 2. Reset WAITING → IDLE
+        # Atualiza priority de cada robot — quem carrega caixa quase a delivery
+        # tem priority mais alta, e cede menos.
+        self._update_priorities()
+
         for robot in self.world.all_robots():
             if robot.state == RobotState.WAITING:
                 robot.state = RobotState.IDLE
 
-        # 3. Física + pick/drop
-        newly_available_boxes: list[int] = []  # box_ids que ficaram disponíveis
+        newly_available_boxes: list[int] = []
         any_pick_happened = False
 
         for robot in self.world.all_robots():
             arrived = physics_tick(self.graph, robot)
-
             if not arrived:
                 continue
 
@@ -392,54 +269,67 @@ class FactoryEnv:
             self.router.arrived(robot, robot.current_node)
             robot.wait_ticks_in_junction = 0
 
-            # --- Drop ---
             drop_reward, delivered, box_id = self._box_manager.on_drop(
                 robot, robot.current_node
             )
             reward += drop_reward
 
+            if delivered:
+                reward += self._delivery_distribution_bonus(robot.current_node)
+
             if box_id is not None:
-                # Caixa acabou de ficar disponível num waypoint intermédio
-                # ou foi entregue — notifica para re-planning
                 if not delivered:
                     newly_available_boxes.append(box_id)
-                # Robot ficou livre após drop
                 self._mark_robot_pending(robot)
                 continue
 
-            # --- Pick automático se robot chegou ao nó da sua caixa assignada ---
             if robot.carrying_box is None and robot.current_node is not None:
                 pick_reward = self._try_auto_pick(robot)
                 reward += pick_reward
                 if pick_reward > 0:
-                    # Pick libertou o nó fonte — pode desbloquear outras caixas
                     any_pick_happened = True
 
-            # --- Robot chegou ao goal sem caixa (pre-posição ou sem assignment) ---
             if robot.reached_goal() and robot.carrying_box is None:
                 self.router.release_all(robot)
                 robot.last_visited.clear()
                 robot.last_edges.clear()
                 self.router.register(robot)
-                self._mark_robot_pending(robot)
+                # Limpa assigned_box_id stuck: chegou ao goal mas a box já não está
+                # pickable cá (foi processada, picked por outro, delivered, etc).
+                if robot.assigned_box_id is not None:
+                    self._release_stuck_assignment(robot)
+                if robot.assigned_box_id is None:
+                    self._mark_robot_pending(robot)
 
-        # 3b. Poll de auto-advance: caixas paradas em processX_entry
-        #     onde o exit emparelhado entretanto ficou livre (e.g. outro
-        #     robot apanhou a caixa que estava no exit) avançam agora.
-        newly_advanced_boxes = self._box_manager.tick_process_advance()
-        for adv_id in newly_advanced_boxes:
-            if adv_id not in newly_available_boxes:
-                newly_available_boxes.append(adv_id)
+        for box_id in newly_available_boxes:
+            box = self._box_manager.get_box(box_id)
+            if box is None or not box.is_available or box.current_node is None:
+                continue
+            for robot in self.world.all_robots():
+                if (
+                    robot.assigned_box_id == box_id
+                    and robot.current_node == box.current_node
+                    and robot.carrying_box is None
+                    and (robot.is_idle() or robot.is_waiting())
+                ):
+                    pick_reward = self._try_auto_pick(robot)
+                    reward += pick_reward
+                    if pick_reward > 0:
+                        any_pick_happened = True
+                        break
 
-        # 4. Liberta nós de origem
         self.router.sync_moving_node_locks(self.world.all_robots())
 
-        # 5. Decisão de movimento (Router)
         robots = self.world.all_robots()
         for robot in robots:
             if robot.state == RobotState.MOVING:
                 continue
-            if robot.is_idle() and robot.current_node == robot.goal_node:
+            # Robot IDLE em descanso (sem goal, ou já no goal) fica quieto —
+            # não invocar router (sem goal devolve None e acumula deadlock).
+            if robot.is_idle() and (
+                robot.goal_node is None
+                or robot.current_node == robot.goal_node
+            ):
                 continue
 
             decision = self.router.decide(robot, robots)
@@ -457,41 +347,161 @@ class FactoryEnv:
             elif action == "unpark":
                 _dispatch_unpark(robot, payload, self.router)
 
-        # 6. Reward de tempo e bloqueio
         active = self.world.all_robots()
         reward += REWARD_PER_TICK * len(active)
+
+        needed_nodes: set[str] = set()
+        for r in active:
+            if r.state == RobotState.WAITING:
+                blocked_next = self.router.next_planned_node(r.id)
+                if blocked_next is not None:
+                    needed_nodes.add(blocked_next)
+
         for robot in active:
+            truly_idle = (
+                robot.is_idle()
+                and robot.carrying_box is None
+                and robot.assigned_box_id is None
+                and robot.current_node is not None
+            )
+            blocking = truly_idle and robot.current_node in needed_nodes
+
+            if blocking:
+                reward += REWARD_IDLE
+
             if robot.state == RobotState.WAITING:
                 reward += REWARD_WAITING
             if robot.wait_ticks_in_junction >= DEADLOCK_THRESHOLD:
                 reward += REWARD_DEADLOCK
 
-        # 7. Re-planning quando há novos eventos:
-        #    - caixa dropada num waypoint intermédio (fica disponível)
-        #    - pick aconteceu (libertou o nó fonte — pode desbloquear outras caixas)
-        #    - nova caixa spawnada (nova opção de assignment)
+        # Apanha robots que já estavam no goal quando a box assigned mudou de
+        # current_node (auto-advance, picked por outro, delivered).
+        self._sweep_stuck_assignments(active)
+
+        # Auto-park: robots IDLE blocking sem trabalho são deslocados pelo env
+        # para parking points geométricos, libertando o nó.
+        self._auto_park_blocking(active, needed_nodes)
+
         if newly_available_boxes or any_pick_happened or newly_spawned:
             self._replan_idle_robots()
 
         return reward
 
-    def _try_auto_pick(self, robot: Robot) -> float:
-        """
-        Pick automático quando o robot chega ao nó de uma caixa.
+    def _update_priorities(self) -> None:
+        """Define robot.priority por tick.
 
-        Prioridade:
-          1. Caixa explicitamente assignada pelo agente (assigned_box_id):
-             se está disponível neste nó, apanha-a.
-             Se o robot tem assignment mas a caixa não está aqui, não faz
-             pickup oportunista — está em trânsito para outro destino.
-          2. Sem assignment explícito (pré-posição ou robot livre): apanha
-             qualquer caixa disponível neste nó que não esteja reservada
-             a outro robot e cujo próximo waypoint esteja livre.
+        - Sem caixa: 0.0
+        - Com caixa: 1.0 + 0.5 * (steps_done/steps_total)
+        Quanto mais perto do delivery, maior priority.
         """
+        for robot in self.world.all_robots():
+            if robot.carrying_box is None:
+                robot.priority = 0.0
+                continue
+            box = self._box_manager.get_box(robot.carrying_box)
+            if box is None:
+                robot.priority = 1.0
+                continue
+            total = max(box.pipeline_total_steps, 1)
+            progress = box.steps_done / total
+            robot.priority = 1.0 + 0.5 * progress
+
+    def _delivery_distribution_bonus(self, exit_node: str) -> float:
+        """Bónus/penalty por equilíbrio de entregas pelos exits.
+
+        Conta entregas por exit; compara com a média esperada. Sub-utilizado dá
+        bónus positivo, saturado dá penalty. Chamado *depois* da box estar DONE,
+        portanto subtrai 1 do exit actual para representar o "antes do delivery".
+        """
+        all_exits = [
+            n for n in self.graph.all_nodes()
+            if self.graph.node_type(n) == "exit"
+        ]
+        if not all_exits:
+            return 0.0
+
+        counts = {n: 0 for n in all_exits}
+        for box in self._box_manager.boxes():
+            if box.is_done and box.current_node in counts:
+                counts[box.current_node] += 1
+
+        # Antes do delivery actual
+        counts[exit_node] = max(0, counts[exit_node] - 1)
+        total = sum(counts.values())
+
+        if total == 0:
+            # Primeiro delivery do episódio → bónus pleno.
+            return REWARD_DISTRIBUTION
+
+        expected = total / len(all_exits)
+        actual   = counts[exit_node]
+        diff_norm = (expected - actual) / max(expected, 1.0)
+        return REWARD_DISTRIBUTION * diff_norm
+
+    def _auto_park_blocking(
+        self,
+        robots       : list[Robot],
+        needed_nodes : set[str],
+    ) -> None:
+        """Auto-parka robots IDLE sem goal que bloqueiam ou ocupam nodes críticos.
+
+        Parka se:
+          (a) O nó está em needed_nodes (outro robot WAITING precisa dele), OU
+          (b) O nó é especial (entry/exit/process) — ocupá-lo IDLE bloqueia
+              futuras entregas/pickups. Reação imediata, sem esperar conflito.
+        """
+        for robot in robots:
+            if not robot.is_idle():
+                continue
+            if robot.carrying_box is not None or robot.assigned_box_id is not None:
+                continue
+            if robot.goal_node is not None:
+                continue
+            if robot.current_node is None:
+                continue
+
+            is_blocking   = robot.current_node in needed_nodes
+            is_in_special = self.graph.is_special(robot.current_node)
+            if not (is_blocking or is_in_special):
+                continue
+
+            park_spec = self.router.find_parking_spec(robot, robots)
+            if park_spec is None:
+                continue
+            _dispatch_park(robot, park_spec, self.router)
+            robot.idle_acknowledged = False
+
+    def _release_stuck_assignment(self, robot: Robot) -> None:
+        """Se a box assigned ao robot já não está pickable no nó actual, limpa."""
+        if robot.assigned_box_id is None or robot.current_node is None:
+            return
+        box = self._box_manager.get_box(robot.assigned_box_id)
+        if (
+            box is None
+            or not box.is_available
+            or box.current_node != robot.current_node
+        ):
+            robot.assigned_box_id = None
+
+    def _sweep_stuck_assignments(self, robots: list[Robot]) -> None:
+        """Detecta robots IDLE no goal com assigned stuck e re-pendê-los."""
+        for robot in robots:
+            if (
+                robot.is_idle()
+                and robot.carrying_box is None
+                and robot.assigned_box_id is not None
+                and robot.current_node is not None
+                and robot.current_node == robot.goal_node
+            ):
+                self._release_stuck_assignment(robot)
+                if robot.assigned_box_id is None:
+                    self._mark_robot_pending(robot)
+
+    def _try_auto_pick(self, robot: Robot) -> float:
+        """Pick automático: caixa reservada se está cá, ou oportunista sem reserva."""
         if robot.current_node is None:
             return 0.0
 
-        # --- 1. Assignment explícito ---
         if robot.assigned_box_id is not None:
             box = self._box_manager.get_box(robot.assigned_box_id)
             if (
@@ -504,11 +514,8 @@ class FactoryEnv:
                     robot.assigned_box_id = None
                     self._sync_goal_to_waypoint(robot)
                     return reward
-            # Tem assignment mas não está no nó certo — deixa o robot continuar
-            # em direcção à sua caixa-alvo sem apanhar outras pelo caminho.
             return 0.0
 
-        # --- 2. Pickup oportunista ---
         if robot.carrying_box is not None:
             return 0.0
 
@@ -551,115 +558,177 @@ class FactoryEnv:
             self.router.register(robot)
 
     def _mark_robot_pending(self, robot: Robot) -> None:
-        """Marca robot como a precisar de decisão do agente."""
+        """Marca robot como pendente de decisão."""
         if robot not in self._pending_robots:
             self._pending_robots.append(robot)
 
     def _replan_idle_robots(self) -> None:
-        """
-        Quando uma nova caixa fica disponível, marca todos os robots
-        IDLE/WAITING sem caixa como pendentes para re-decisão.
+        """Marca robots livres + em trânsito p/ pickup como pendentes.
+
+        Chamado quando há novidade no mundo (newly_available_boxes, picks,
+        spawns). Só reseta idle_acknowledged para robots que efectivamente
+        se tornam pendentes — robots ocupados não são perturbados.
         """
         for robot in self.world.all_robots():
-            if robot.is_free() and robot not in self._pending_robots:
+            if robot in self._pending_robots:
+                continue
+            if robot.is_free():
+                robot.idle_acknowledged = False
+                self._pending_robots.append(robot)
+                continue
+            # Em trânsito para pickup: tem assignment, ainda não tem caixa.
+            # Pode ser necessário reatribuir se a box já não estiver disponível.
+            if (
+                robot.state == RobotState.MOVING
+                and robot.carrying_box is None
+                and robot.assigned_box_id is not None
+            ):
+                robot.idle_acknowledged = False
                 self._pending_robots.append(robot)
 
-    # ------------------------------------------------------------------
-    # Internos — assignments
-    # ------------------------------------------------------------------
-
     def _apply_assignments(self, assignments: dict[str, int | str]) -> float:
-        """
-        Executa os assignments do agente.
+        """Aplica assignments {robot_id: (box_id, drop_node) | None}.
 
-        Para cada robot pendente, se houver assignment:
-          - int   → robot vai buscar a caixa (goal = current_node da caixa)
-          - str   → robot vai para nó de pre-posição
-          - None  → robot fica IDLE (sem assignment)
-
-        Garante:
-          - nenhuma caixa é assignada duas vezes no mesmo step
-          - nenhum destino (next_waypoint) é reservado por dois robots
-            no mesmo step (regra de capacidade 1 caixa por nó)
-
-        Devolve reward imediato (0 — reward chega no drop/pick).
+        2 passes:
+          1. Box pickups — valida e define (box, waypoint, goal).
+          2. Idle        — limpa estado para robots sem assignment.
         """
         reward = 0.0
 
-        # Conjunto de caixas já assignadas neste step
-        assigned_boxes: set[int] = set()
-        # Conjunto de next_waypoints reservados neste step
-        assigned_next_waypoints: set[str] = set()
-        # Conjunto de nós de pre-posição já assignados neste step
-        assigned_goals: set[str] = set()
+        assigned_boxes          : set[int] = set()
+        assigned_next_waypoints : set[str] = set()
 
+        # Snapshot pre-reset por robot pendente, para detectar abort/changes
+        # de assignment a meio do trajeto. Capturamos (box_id, target) onde
+        # target = box.next_waypoint do prior assignment.
+        prior_full: dict[str, tuple[int | None, str | None]] = {}
         for robot in self._pending_robots:
             if not self.world.has_robot(robot.id):
                 continue
+            prior_target: str | None = None
+            if robot.assigned_box_id is not None:
+                box = self._box_manager.get_box(robot.assigned_box_id)
+                if box is not None:
+                    prior_target = box.next_waypoint
+            prior_full[robot.id] = (robot.assigned_box_id, prior_target)
 
-            # Limpa o assignment anterior antes de processar o novo
+        # Pre-limpa o assignment anterior em todos os pendentes (necessário para
+        # had_box_assignment e para que o pass de boxes possa re-atribuir).
+        # Se o robot estava a ir buscar uma box (sem ter pegado ainda), liberta
+        # box.next_waypoint para a box voltar a ser candidate com novas opções.
+        prior_had_assignment: dict[str, bool] = {}
+        valid_pending: list[Robot] = []
+        for robot in self._pending_robots:
+            if not self.world.has_robot(robot.id):
+                continue
+            prior_had_assignment[robot.id] = robot.assigned_box_id is not None
+            if (
+                robot.assigned_box_id is not None
+                and robot.carrying_box is None
+            ):
+                box = self._box_manager.get_box(robot.assigned_box_id)
+                if box is not None and box.is_available:
+                    box.next_waypoint = None
             robot.assigned_box_id = None
+            valid_pending.append(robot)
 
+        # ── Pass 1: box pickups (target = (box_id, drop_node)) ───────────
+        for robot in valid_pending:
             target = assignments.get(robot.id)
-
-            if target is None:
-                # Sem assignment — robot fica IDLE no nó actual
+            if not isinstance(target, tuple) or len(target) != 2:
+                continue
+            box_id, drop_node = target
+            if not isinstance(box_id, int) or not isinstance(drop_node, str):
                 robot.state = RobotState.IDLE
                 continue
 
-            if isinstance(target, int):
-                # Assignment para caixa
-                box = self._box_manager.get_box(target)
-                if box is None or not box.is_available:
-                    robot.state = RobotState.IDLE
-                    continue
-                if target in assigned_boxes:
-                    # Caixa já assignada a outro robot neste step
-                    robot.state = RobotState.IDLE
-                    continue
+            box = self._box_manager.get_box(box_id)
+            if box is None or not box.is_available or box_id in assigned_boxes:
+                robot.state = RobotState.IDLE
+                continue
 
-                # Verificação de capacidade: o destino da caixa deve estar livre
-                next_wp = box.next_waypoint
-                if next_wp is not None:
-                    if next_wp in assigned_next_waypoints:
-                        # Outro robot já vai para este nó neste step
-                        robot.state = RobotState.IDLE
-                        continue
-                    if not self._box_manager.is_node_drop_available(next_wp):
-                        # Já há uma caixa lá ou a caminho
-                        robot.state = RobotState.IDLE
-                        continue
-                    assigned_next_waypoints.add(next_wp)
+            # Valida que drop_node é uma opção válida da pipeline da box.
+            valid_targets = box.target_options()
+            if drop_node not in valid_targets:
+                robot.state = RobotState.IDLE
+                continue
 
-                assigned_boxes.add(target)
-                robot.assigned_box_id = target
-                goal = box.current_node
-                self._set_robot_goal(robot, goal)
+            if drop_node in assigned_next_waypoints:
+                robot.state = RobotState.IDLE
+                continue
+            if not self._box_manager.is_node_drop_available(drop_node):
+                robot.state = RobotState.IDLE
+                continue
+            assigned_next_waypoints.add(drop_node)
 
-            elif isinstance(target, str):
-                # Assignment para nó de pre-posição (sem caixa específica)
-                if target in assigned_goals:
-                    robot.state = RobotState.IDLE
-                    continue
-                assigned_goals.add(target)
-                self._set_robot_goal(robot, target)
+            # Set o destino escolhido pelo agent.
+            box.next_waypoint = drop_node
+
+            assigned_boxes.add(box_id)
+            robot.assigned_box_id = box_id
+            goal = box.current_node
+            self._set_robot_goal(robot, goal)
+
+            if robot.current_node == goal:
+                reward += self._try_auto_pick(robot)
+
+        # ── Pass 2: idle — robots sem box assignment ─────────────────────
+        for robot in valid_pending:
+            if robot.assigned_box_id is not None:
+                continue
+            # Preserva PARKED e MOVING (estados com física activa).
+            if robot.state not in (RobotState.PARKED, RobotState.MOVING):
+                robot.state = RobotState.IDLE
+            robot.idle_acknowledged = True
+            if prior_had_assignment.get(robot.id) or robot.goal_node is not None:
+                self.router.release_all(robot)
+                robot.goal_node = None
+                robot.last_visited.clear()
+                robot.last_edges.clear()
+                self.router.register(robot)
+
+        # Robots com box assignment saem do idle.
+        for robot in valid_pending:
+            if robot.assigned_box_id is not None:
+                robot.idle_acknowledged = False
+
+        # REWARD_ABORT: por cada robot que tinha assignment prior e mudou para
+        # algo diferente (outra box, outro target, ou idle).
+        for robot in valid_pending:
+            prior = prior_full.get(robot.id)
+            if prior is None:
+                continue
+            prior_box, prior_target = prior
+            if prior_box is None:
+                continue
+            new_box    = robot.assigned_box_id
+            new_target = None
+            if new_box is not None:
+                box = self._box_manager.get_box(new_box)
+                if box is not None:
+                    new_target = box.next_waypoint
+            if (prior_box, prior_target) != (new_box, new_target):
+                reward += REWARD_ABORT
 
         return reward
 
     def _set_robot_goal(self, robot: Robot, goal: str) -> None:
-        """Define o goal do robot e regista no router."""
+        """Define o goal do robot e regista no router.
+
+        Preserva state=PARKED (router faz unpark) e state=MOVING (robot
+        continua o trajeto e o router replan automaticamente para o novo goal).
+        Só força IDLE se o robot estava em WAITING/IDLE.
+        """
         self.router.release_all(robot)
         robot.goal_node = goal
         robot.last_visited.clear()
         robot.last_edges.clear()
-        robot.state = RobotState.IDLE
+        if robot.state not in (RobotState.PARKED, RobotState.MOVING):
+            robot.state = RobotState.IDLE
         self.router.register(robot)
 
-    # ------------------------------------------------------------------
-    # Internos — spawn
-    # ------------------------------------------------------------------
-
     def _maybe_spawn_robots(self) -> None:
+        """Spawn de robots ainda não activos cujo tick chegou."""
         tick = self.world.tick
         for i, robot in enumerate(self._robots_list):
             if self.world.has_robot(robot.id):
@@ -684,50 +753,43 @@ class FactoryEnv:
 
             self.world.add_robot(robot)
             self.router.register(robot)
-
-            # Robot recém-spawnado precisa de assignment imediato
             self._mark_robot_pending(robot)
 
-    # ------------------------------------------------------------------
-    # Internos — estado exposto ao agente
-    # ------------------------------------------------------------------
-
     def _build_state(self) -> dict:
-        """
-        Estado bruto do mundo para o agente construir o HeteroGraph.
-
-        Contém toda a informação necessária sem processamento.
-        """
+        """Estado bruto para o agente construir o HeteroGraph."""
         all_robots = self.world.all_robots() if self.world else []
-
-        # Robots pendentes vão re-decidir agora — as suas reservas anteriores
-        # não devem mascarar as caixas/nós disponíveis (senão o agente não as
-        # vê e o robot acaba sem assignment válido).
         pending_ids: set[str] = {r.id for r in self._pending_robots}
 
-        # Caixas já assignadas (assigned_box_id set) mas ainda não apanhadas
         already_assigned_boxes = {
             r.assigned_box_id
             for r in all_robots
             if r.assigned_box_id is not None and r.id not in pending_ids
         }
 
-        # Nós já usados como goal por outros robots
-        already_targeted_nodes = {
-            r.goal_node
-            for r in all_robots
-            if r.goal_node is not None and r.id not in pending_ids
+        # Candidatos (box_id, target_node) para o agent.
+        in_transit_targets = {
+            b.next_waypoint for b in self._box_manager.active_boxes()
+            if b.is_in_transit and b.next_waypoint is not None
         }
+        available_box_targets: list[tuple[int, str]] = []
+        for box in self._box_manager.available_boxes():
+            if box.box_id in already_assigned_boxes:
+                continue
+            for target in box.target_options():
+                if target in in_transit_targets:
+                    continue
+                if not self._box_manager.is_node_drop_available(target):
+                    continue
+                available_box_targets.append((box.box_id, target))
 
-        # Pre-posições úteis: nós actuais de caixas disponíveis
-        # + próximos waypoints de caixas em trânsito
-        # → só faz sentido pré-posicionar onde as caixas estão ou vão parar
-        useful_preposition: set[str] = set()
-        for box in self._box_manager.active_boxes():
-            if box.is_waiting and box.current_node:
-                useful_preposition.add(box.current_node)
-            if box.is_in_transit and box.next_waypoint:
-                useful_preposition.add(box.next_waypoint)
+        # Future paths dos robots (próximos K nodes planeados). O agent vê para
+        # onde os outros vão para coordenar espacialmente.
+        future_paths: dict[str, list[str]] = {}
+        if self.router is not None:
+            for r in all_robots:
+                fp = self.router.peek_plan(r.id, k_steps=5)
+                if fp:
+                    future_paths[r.id] = fp
 
         return {
             "tick":               self.world.tick if self.world else 0,
@@ -738,45 +800,35 @@ class FactoryEnv:
                 b.box_id for b in self._box_manager.available_boxes()
                 if b.box_id not in already_assigned_boxes
             ],
-            "preposition_nodes":  [
-                n for n in self.preposition_nodes
-                if n in useful_preposition and n not in already_targeted_nodes
-            ],
+            "available_box_targets": available_box_targets,
+            "future_paths":       future_paths,
             "graph_nodes":        self._graph_node_features(),
             "graph_edges":        self._graph_edge_features(),
         }
 
     def _graph_node_features(self) -> dict[str, dict]:
-        """Features de cada nó do mapa para o HeteroGraph."""
+        """Features de cada nó do mapa.
+
+        Partes estáticas (type, pos, betweenness, degree, dist_to_*)
+        são lidas do cache pré-computado no __init__. Só as duas propriedades
+        dinâmicas (n_robots_here, n_boxes_waiting) são calculadas por step.
+        """
+        world    = self.world
         features = {}
-        for node in self.graph.all_nodes():
-            node_type = self.graph.node_type(node)
-            x, y      = self.graph.node_position(node)
+        for node, static in self._cached_node_static.items():
             features[node] = {
-                "type": node_type,
-                "x":    x,
-                "y":    y,
-                "n_robots_here":   len(self.world.robots_on_node(node)) if self.world else 0,
+                **static,
+                "n_robots_here":   len(world.robots_on_node(node)) if world else 0,
                 "n_boxes_waiting": len(self._box_manager.available_boxes_at(node)),
             }
         return features
 
     def _graph_edge_features(self) -> list[dict]:
-        """Arestas do mapa com distâncias — para o HeteroGraph."""
-        edges = []
-        for u, v, data in self.graph.graph.edges(data=True):
-            edges.append({
-                "from":     u,
-                "to":       v,
-                "distance": data.get("distance", 1.0),
-            })
-        return edges
-
-    # ------------------------------------------------------------------
-    # Internos — info
-    # ------------------------------------------------------------------
+        """Arestas com distância (topologia estática — devolvido do cache)."""
+        return self._cached_graph_edges
 
     def _build_info(self, reward: float = 0.0) -> dict:
+        """Info dict para debug/logging."""
         if self.world is None:
             return {}
         return {
@@ -786,13 +838,8 @@ class FactoryEnv:
             "queued_boxes":       self._box_manager.queue_count(),
             "all_delivered":      self._box_manager.all_delivered(),
             "pending_robot_ids":  [r.id for r in self._pending_robots],
-            "preposition_nodes":  self.preposition_nodes,
             "step_reward":        reward,
         }
-
-    # ------------------------------------------------------------------
-    # Render / close
-    # ------------------------------------------------------------------
 
     def render(self) -> None:
         if self.render_mode == "human":

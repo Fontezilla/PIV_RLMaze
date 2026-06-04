@@ -1,6 +1,6 @@
-from __future__ import annotations
+"""Física do movimento dos robots no grafo."""
 
-import math
+from __future__ import annotations
 
 from env.core.entities import Robot, RobotState
 from env.core.graph import FactoryGraph
@@ -28,6 +28,7 @@ def is_dead_end(graph: FactoryGraph, node: str) -> bool:
 
 
 def turn_delay(graph: FactoryGraph, came_from: str | None, at: str, going_to: str) -> int:
+    """Ticks de atraso por turn em `at`."""
     if came_from is None or came_from == at:
         return 0
 
@@ -38,20 +39,14 @@ def turn_delay(graph: FactoryGraph, came_from: str | None, at: str, going_to: st
 
     if angle >= 150:
         return TURN_TICKS_180
-
     if angle >= TURN_THRESHOLD:
         return TURN_TICKS_90
-
     return 0
 
 
 def _is_curve(graph: FactoryGraph, came_from: str | None, at: str, going_to: str) -> bool:
-    if came_from is None or came_from == at:
+    if came_from is None or came_from == at or came_from == going_to:
         return False
-
-    if came_from == going_to:
-        return False
-
     try:
         return graph.turn_angle(came_from, at, going_to) >= TURN_THRESHOLD
     except (ValueError, KeyError):
@@ -70,14 +65,10 @@ def edge_speed_limit(graph: FactoryGraph, robot: Robot) -> float:
     if robot.parked_at is not None:
         return V_CURVE
 
-    # V_REVERSE only when backing OUT of a dead-end (from_node is the dead-end,
-    # progress > 0 means the robot is mid-edge reversing, not a fresh forward dispatch
-    # after turning around at the dead-end node).
     if is_dead_end(graph, from_node) and robot.progress > 0.01:
         return V_REVERSE
 
     dist = graph.edge_distance(from_node, to_node)
-
     if dist <= 0:
         return V_STRAIGHT
 
@@ -92,7 +83,6 @@ def edge_speed_limit(graph: FactoryGraph, robot: Robot) -> float:
         for next_node in graph.neighbors(to_node):
             if next_node == from_node:
                 continue
-
             if _is_curve(graph, from_node, to_node, next_node):
                 return V_CURVE
 
@@ -100,7 +90,7 @@ def edge_speed_limit(graph: FactoryGraph, robot: Robot) -> float:
 
 
 def compute_world_pos(graph: FactoryGraph, robot: Robot) -> tuple[float, float]:
-    """Calcula a posição mundial interpolada do robot."""
+    """Posição mundial interpolada do robot."""
     if robot.state == RobotState.MOVING and robot.from_node and robot.to_node:
         x0, y0 = graph.node_position(robot.from_node)
         x1, y1 = graph.node_position(robot.to_node)
@@ -118,13 +108,7 @@ def compute_world_pos(graph: FactoryGraph, robot: Robot) -> tuple[float, float]:
 
 
 def tick(graph: FactoryGraph, robot: Robot) -> bool:
-    """
-    Avança o robot um tick.
-
-    Retorna True quando o robot chegou:
-    - a um nó normal;
-    - ou a um ponto de parking.
-    """
+    """Avança o robot um tick. True quando chega a um nó ou parking point."""
     if robot.wait_ticks > 0:
         robot.wait_ticks -= 1
         robot.world_x, robot.world_y = compute_world_pos(graph, robot)
@@ -147,14 +131,9 @@ def tick(graph: FactoryGraph, robot: Robot) -> bool:
         robot.speed = max(robot.speed - ACCEL, target)
 
     dist = graph.edge_distance(robot.from_node, robot.to_node)
-
-    if dist <= 0:
-        delta = 1.0
-    else:
-        delta = robot.speed / dist
+    delta = 1.0 if dist <= 0 else robot.speed / dist
 
     target_progress = 1.0
-
     if robot.parked_at is not None:
         _, _, frac = robot.parked_at
         target_progress = frac
@@ -167,16 +146,13 @@ def tick(graph: FactoryGraph, robot: Robot) -> bool:
 
     if robot.parked_at is not None:
         u, v, frac = robot.parked_at
-
         robot.state        = RobotState.PARKED
         robot.current_node = u
         robot.from_node    = None
         robot.to_node      = None
         robot.progress     = frac
         robot.speed        = 0.0
-
         robot.world_x, robot.world_y = graph.parking_point_position(u, v, frac)
-
         return True
 
     robot.came_from    = robot.from_node
@@ -186,40 +162,5 @@ def tick(graph: FactoryGraph, robot: Robot) -> bool:
     robot.progress     = 0.0
     robot.state        = RobotState.IDLE
     robot.speed        = 0.0
-
     robot.world_x, robot.world_y = graph.node_position(robot.current_node)
-
     return True
-
-
-def traversal_ticks(graph: FactoryGraph, came_from: str | None, at: str, to: str) -> int:
-    """Estimativa de ticks para percorrer a aresta at→to."""
-    dist = graph.edge_distance(at, to)
-
-    if is_dead_end(graph, to):
-        return max(1, math.ceil(dist / V_REVERSE))
-
-    curve_exit = _is_curve(graph, came_from, at, to)
-
-    curve_approach = any(
-        _is_curve(graph, at, to, nb)
-        for nb in graph.neighbors(to)
-        if nb != at
-    )
-
-    straight_dist = dist
-
-    if curve_exit:
-        straight_dist -= CURVE_ZONE
-
-    if curve_approach:
-        straight_dist -= CURVE_ZONE
-
-    straight_dist = max(0.0, straight_dist)
-    curve_dist    = max(0.0, dist - straight_dist)
-
-    t_straight = straight_dist / V_STRAIGHT if straight_dist > 0 else 0.0
-    t_curve    = curve_dist / V_CURVE if curve_dist > 0 else 0.0
-    t_turn     = turn_delay(graph, came_from, at, to)
-
-    return max(1, math.ceil(t_straight + t_curve + t_turn))

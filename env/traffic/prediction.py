@@ -9,14 +9,13 @@ from env.core.graph import FactoryGraph
 
 LOOKAHEAD_STEPS = 5
 
-PENALTY_RESERVED_EDGE = 10_000.0
-PENALTY_ENTRY_EXIT_EDGE = 900.0
-PENALTY_PROCESS_EDGE = 750.0
-PENALTY_JUNCTION_CORRIDOR = 250.0
-PENALTY_DEAD_END = 350.0
+PENALTY_RESERVED_EDGE      = 10_000.0
+PENALTY_ENTRY_EXIT_EDGE    = 900.0
+PENALTY_PROCESS_EDGE       = 750.0
+PENALTY_JUNCTION_CORRIDOR  = 250.0
+PENALTY_DEAD_END           = 350.0
 PENALTY_NEAR_GOAL_OF_OTHER = 1200.0
-PENALTY_OCCUPIED_NOW = 10_000.0
-PENALTY_SAME_EDGE_AS_PARKED = 10_000.0
+PENALTY_OCCUPIED_NOW       = 10_000.0
 
 MAX_PARKED_TICKS_SOFT = 14
 MAX_PARKED_TICKS_HARD = 45
@@ -24,19 +23,7 @@ MAX_PARKED_TICKS_HARD = 45
 
 @dataclass(frozen=True)
 class ParkingCandidate:
-    """
-    Candidato de parking.
-
-    edge:
-        Aresta direccional que o robot deve percorrer para estacionar.
-        Exemplo: ("N", "L") significa sair de N em direcção a L.
-
-    fraction:
-        Fracção ao longo da aresta edge[0] -> edge[1].
-
-    score:
-        Quanto menor, melhor.
-    """
+    """Candidato de parking."""
     edge: tuple[str, str]
     fraction: float
     score: float
@@ -65,13 +52,7 @@ def robot_parked_edge(robot: Robot) -> tuple[str, str] | None:
 
 
 def robot_reference_node(robot: Robot) -> str | None:
-    """
-    Nó lógico de referência para previsão.
-
-    - Se está num nó, usa current_node.
-    - Se está a mover, usa to_node como aproximação do próximo nó.
-    - Se está estacionado, usa o nó de origem do parking.
-    """
+    """Nó lógico de referência para previsão."""
     if robot.current_node is not None:
         return robot.current_node
 
@@ -94,11 +75,7 @@ def choose_greedy_next_node(
     goal: str,
     previous: str | None,
 ) -> str | None:
-    """
-    Escolhe o próximo nó por heurística simples.
-
-    Evita voltar imediatamente para trás quando há alternativa.
-    """
+    """Escolhe o próximo nó por heurística simples."""
     candidates: list[tuple[float, str]] = []
     neighbors = graph.neighbors(current)
 
@@ -125,11 +102,7 @@ def predict_robot_edges(
     robot: Robot,
     steps: int = LOOKAHEAD_STEPS,
 ) -> list[tuple[str, str]]:
-    """
-    Estima as próximas arestas de um robot sem planeamento pesado.
-
-    Retorna arestas canónicas, porque isto serve para detectar ocupação/conflito.
-    """
+    """Estima as próximas arestas de um robot sem planeamento pesado."""
     predicted: list[tuple[str, str]] = []
 
     current_edge = robot_current_edge(robot)
@@ -179,12 +152,7 @@ def build_future_edge_usage(
     exclude_robot_id: str | None = None,
     steps: int = LOOKAHEAD_STEPS,
 ) -> dict[tuple[str, str], set[str]]:
-    """
-    Cria mapa:
-        edge -> {robot_id, ...}
-
-    Inclui arestas ocupadas agora e próximas arestas previstas.
-    """
+    """Cria mapa:"""
     usage: dict[tuple[str, str], set[str]] = {}
 
     for robot in robots:
@@ -268,12 +236,7 @@ def score_parking_edge(
     future_usage: dict[tuple[str, str], set[str]],
     occupied_now: set[tuple[str, str]],
 ) -> float:
-    """
-    Pontua uma aresta para parking.
-
-    Usa directed_edge para manter a direcção real,
-    mas compara ocupação com canonical_edge.
-    """
+    """Pontua uma aresta para parking."""
     u, v = directed_edge
     canonical = canonical_edge(u, v)
 
@@ -323,16 +286,7 @@ def find_safe_parking_candidate(
     robot: Robot,
     robots: Iterable[Robot],
 ) -> ParkingCandidate | None:
-    """
-    Procura parking seguro numa aresta adjacente ao robot.
-
-    Importante:
-    - não procura em qualquer ponto do mapa;
-    - só considera arestas que o robot consegue usar a partir do nó actual;
-    - evita arestas previstas por outros robots;
-    - penaliza entries, exits, process edges e corredores entre junctions,
-      mas não as proíbe de forma absoluta.
-    """
+    """Procura parking seguro numa aresta adjacente ao robot."""
     if robot.current_node is None:
         return None
 
@@ -434,29 +388,19 @@ def parked_robot_should_leave(
     robot: Robot,
     robots: Iterable[Robot],
 ) -> bool:
-    """
-    Decide se um robot PARKED deve sair do parking.
-
-    Critérios:
-    - está a bloquear uma rota prevista;
-    - já está estacionado há demasiados ticks;
-    - o seu próprio caminho aparenta estar livre.
-    """
+    """Decide se um robot PARKED deve sair do parking."""
     if robot.state != RobotState.PARKED:
         return False
 
     if parked_robot_blocks_someone(graph, robot, robots):
         return True
 
-    # Em alguns runners, robots em PARKED continuam a incrementar
-    # wait_ticks_in_junction em vez de parked_ticks. Usamos o máximo
-    # para evitar que um robot fique estacionado indefinidamente.
-    parked_ticks = max(robot.parked_ticks, robot.wait_ticks_in_junction)
+    ticks = robot.wait_ticks_in_junction
 
-    if parked_ticks >= MAX_PARKED_TICKS_HARD:
+    if ticks >= MAX_PARKED_TICKS_HARD:
         return True
 
-    if parked_ticks < MAX_PARKED_TICKS_SOFT:
+    if ticks < MAX_PARKED_TICKS_SOFT:
         return False
 
     own_edges = predict_robot_edges(graph, robot, LOOKAHEAD_STEPS)

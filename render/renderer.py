@@ -169,6 +169,7 @@ class Renderer:
         self._draw_nodes(world)
         self._draw_boxes(world, info, overrides)
         self._draw_robots(world, overrides)
+        self._draw_delivered_counters(info)
         self._draw_panel(world, info)
 
     def _draw_pause_overlay(self) -> None:
@@ -330,6 +331,45 @@ class Renderer:
                 (pos[0] - lbl.get_width() // 2, pos[1] - ROBOT_RADIUS - 14),
             )
 
+    def _draw_delivered_counters(self, info: dict | None) -> None:
+        """Badge dourado em cima de cada exit com a contagem de boxes DONE."""
+        if not info:
+            return
+        boxes = info.get("boxes") or []
+
+        counts: dict[str, int] = {}
+        for box in boxes:
+            if box.get("status") != "DONE":
+                continue
+            # Para boxes DONE, current_node é o exit final onde foram entregues.
+            exit_node = box.get("current_node")
+            if not exit_node:
+                continue
+            counts[exit_node] = counts.get(exit_node, 0) + 1
+
+        if not counts:
+            return
+
+        for node, n in counts.items():
+            try:
+                nx, ny = self._to_screen(node)
+            except Exception:
+                continue
+
+            # Badge à direita do node, ligeiramente acima do label.
+            bx = nx + NODE_RADIUS + 10
+            by = ny - 2
+            radius = 10
+
+            pygame.gfxdraw.filled_circle(self._screen, bx, by, radius, (30, 30, 35))
+            pygame.gfxdraw.aacircle(self._screen, bx, by, radius, HEADER_COLOR)
+
+            lbl = self._font_md.render(str(n), True, HEADER_COLOR)
+            self._screen.blit(
+                lbl,
+                (bx - lbl.get_width() // 2, by - lbl.get_height() // 2),
+            )
+
     def _draw_boxes(self, world: World, info: dict | None, overrides: dict | None) -> None:
         """Desenha caixas WAITING (diamante no nó) e IN_TRANSIT (ponto no robot)."""
         if not info:
@@ -417,7 +457,6 @@ class Renderer:
             py += h
 
         def hline() -> None:
-            nonlocal py
             pygame.draw.line(
                 self._screen,
                 PANEL_BORDER,
