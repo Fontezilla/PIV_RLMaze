@@ -1,0 +1,20 @@
+[gd_scene format=3 uid="uid://bgktrd72qsqpq"]
+
+[ext_resource type="Script" uid="uid://dg6f1rx4fp4ho" path="res://scripts/factory_builder.gd" id="1_r3gb1"]
+[ext_resource type="Script" uid="uid://nfljww2xjfre" path="res://scripts/camera_controller.gd" id="2_lmr8u"]
+[ext_resource type="Script" uid="uid://bb62otwlgg1bl" path="res://scripts/episode_replay.gd" id="3_1adwy"]
+
+[node name="Factory" type="Node3D" unique_id=2124983725]
+script = ExtResource("1_r3gb1")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=604659078]
+transform = Transform3D(1, 0, 0, 0, 0.70710677, 0.70710677, 0, -0.70710677, 0.70710677, 0, 5, 8)
+current = true
+fov = 65.0
+size = 18.0
+script = ExtResource("2_lmr8u")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=2086742215]
+
+[node name="EpisodeReplay" type="Node3D" parent="." unique_id=715587121]
+script = ExtResource("3_1adwy")

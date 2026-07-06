@@ -1,0 +1,217 @@
+{
+  "nodes": {
+	"entryA": {
+	  "type": "entry",
+	  "description": "Entry point A",
+	  "coords": [0, 0]
+	},
+	"entryB": {
+	  "type": "entry",
+	  "description": "Entry point B",
+	  "coords": [0, 150]
+	},
+	"entryC": {
+	  "type": "entry",
+	  "description": "Entry point C",
+	  "coords": [0, 300]
+	},
+	"entryD": {
+	  "type": "entry",
+	  "description": "Entry point D",
+	  "coords": [0, 450]
+	},
+	"A": {
+	  "type": "junction",
+	  "description": "Connected to entryA",
+	  "coords": [217.5, 0]
+	},
+	"B": {
+	  "type": "junction",
+	  "description": "Connected to entryB",
+	  "coords": [217.5, 150]
+	},
+	"C": {
+	  "type": "junction",
+	  "description": "Connected to entryC",
+	  "coords": [217.5, 300]
+	},
+	"D": {
+	  "type": "junction",
+	  "description": "Connected to entryD",
+	  "coords": [217.5, 450]
+	},
+	"E": {
+	  "type": "junction",
+	  "description": "Intermediate junction",
+	  "coords": [217.5, 692.5]
+	},
+	"F": {
+	  "type": "junction",
+	  "description": "Intermediate junction",
+	  "coords": [217.5, 1385]
+	},
+	"G": {
+	  "type": "junction",
+	  "description": "Junction to processB1_entry",
+	  "coords": [430, 692.5]
+	},
+	"H": {
+	  "type": "junction",
+	  "description": "Junction to processB1_exit",
+	  "coords": [430, 1385]
+	},
+	"I": {
+	  "type": "junction",
+	  "description": "Junction to processA1_entry",
+	  "coords": [580, 0]
+	},
+	"J": {
+	  "type": "junction",
+	  "description": "Junction for processA1_exit & processB2_entry",
+	  "coords": [580, 692.5]
+	},
+	"K": {
+	  "type": "junction",
+	  "description": "Junction for processB2_exit",
+	  "coords": [580, 1385]
+	},
+	"L": {
+	  "type": "junction",
+	  "description": "Junction for processA2_entry",
+	  "coords": [730, 0]
+	},
+	"M": {
+	  "type": "junction",
+	  "description": "Junction for processA2_exit",
+	  "coords": [730, 692.5]
+	},
+	"N": {
+	  "type": "junction",
+	  "description": "Intermediate junction",
+	  "coords": [942.5, 0]
+	},
+	"O": {
+	  "type": "junction",
+	  "description": "Intermediate junction",
+	  "coords": [942.5, 692.5]
+	},
+	"P": {
+	  "type": "junction",
+	  "description": "Junction for exitA",
+	  "coords": [942.5, 935]
+	},
+	"Q": {
+	  "type": "junction",
+	  "description": "Junction for exitB",
+	  "coords": [942.5, 1085]
+	},
+	"R": {
+	  "type": "junction",
+	  "description": "Junction for exitC",
+	  "coords": [942.5, 1235]
+	},
+	"S": {
+	  "type": "junction",
+	  "description": "Junction for exitD",
+	  "coords": [942.5, 1385]
+	},
+	"processA1_entry": {
+	  "type": "processA_entry",
+	  "description": "Process A1 entry",
+	  "coords": [580, 260]
+	},
+	"processA1_exit": {
+	  "type": "processA_exit",
+	  "description": "Process A1 exit",
+	  "coords": [580, 432.5]
+	},
+	"processA2_entry": {
+	  "type": "processA_entry",
+	  "description": "Process A2 entry",
+	  "coords": [730, 260]
+	},
+	"processA2_exit": {
+	  "type": "processA_exit",
+	  "description": "Process A2 exit",
+	  "coords": [730, 432.5]
+	},
+	"processB1_entry": {
+	  "type": "processB_entry",
+	  "description": "Process B1 entry",
+	  "coords": [430, 952.5]
+	},
+	"processB1_exit": {
+	  "type": "processB_exit",
+	  "description": "Process B1 exit",
+	  "coords": [430, 1125]
+	},
+	"processB2_entry": {
+	  "type": "processB_entry",
+	  "description": "Process B2 entry",
+	  "coords": [580, 952.5]
+	},
+	"processB2_exit": {
+	  "type": "processB_exit",
+	  "description": "Process B2 exit",
+	  "coords": [580, 1125]
+	},
+	"exitA": {
+	  "type": "exit",
+	  "description": "Exit point A",
+	  "coords": [1160, 935]
+	},
+	"exitB": {
+	  "type": "exit",
+	  "description": "Exit point B",
+	  "coords": [1160, 1085]
+	},
+	"exitC": {
+	  "type": "exit",
+	  "description": "Exit point C",
+	  "coords": [1160, 1235]
+	},
+	"exitD": {
+	  "type": "exit",
+	  "description": "Exit point D",
+	  "coords": [1160, 1385]
+	}
+  },
+  "edges": [
+	{ "from": "entryA", "to": "A", "distance": 217.5 },
+	{ "from": "entryB", "to": "B", "distance": 217.5 },
+	{ "from": "entryC", "to": "C", "distance": 217.5 },
+	{ "from": "entryD", "to": "D", "distance": 217.5 },
+	{ "from": "A", "to": "B", "distance": 150 },
+	{ "from": "A", "to": "I", "distance": 362.5 },
+	{ "from": "B", "to": "C", "distance": 150 },
+	{ "from": "C", "to": "D", "distance": 150 },
+	{ "from": "D", "to": "E", "distance": 260 },
+	{ "from": "E", "to": "F", "distance": 692.5 },
+	{ "from": "E", "to": "G", "distance": 212.5 },
+	{ "from": "F", "to": "H", "distance": 212.5 },
+	{ "from": "G", "to": "processB1_entry", "distance": 260 },
+	{ "from": "G", "to": "J", "distance": 150 },
+	{ "from": "processB1_exit", "to": "H", "distance": 260 },
+	{ "from": "H", "to": "K", "distance": 150 },
+	{ "from": "I", "to": "processA1_entry", "distance": 260 },
+	{ "from": "I", "to": "L", "distance": 150 },
+	{ "from": "processA1_exit", "to": "J", "distance": 260 },
+	{ "from": "J", "to": "processB2_entry", "distance": 260 },
+	{ "from": "J", "to": "M", "distance": 150 },
+	{ "from": "processB2_exit", "to": "K", "distance": 260 },
+	{ "from": "K", "to": "S", "distance": 362.5 },
+	{ "from": "L", "to": "processA2_entry", "distance": 260 },
+	{ "from": "L", "to": "N", "distance": 212.5 },
+	{ "from": "processA2_exit", "to": "M", "distance": 260 },
+	{ "from": "M", "to": "O", "distance": 212.5 },
+	{ "from": "N", "to": "O", "distance": 692.5 },
+	{ "from": "O", "to": "P", "distance": 260 },
+	{ "from": "P", "to": "exitA", "distance": 217.5 },
+	{ "from": "P", "to": "Q", "distance": 150 },
+	{ "from": "Q", "to": "exitB", "distance": 217.5 },
+	{ "from": "Q", "to": "R", "distance": 150 },
+	{ "from": "R", "to": "exitC", "distance": 217.5 },
+	{ "from": "R", "to": "S", "distance": 150 },
+	{ "from": "S", "to": "exitD", "distance": 217.5 }
+  ]
+}
