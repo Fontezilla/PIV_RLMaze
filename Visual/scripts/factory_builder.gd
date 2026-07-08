@@ -30,7 +30,6 @@ func _ready():
 	build_subnode_markers()
 
 	setup_camera()
-	spawn_robot()
 
 
 # Marcadores invisíveis (sem malha, sem material) para os nós de corredor do
@@ -57,27 +56,6 @@ func build_subnode_markers():
 		add_child(marker)
 
 
-func spawn_robot():
-	var robot_holder := Node3D.new()
-	add_child(robot_holder)
-
-	var robot = preload("res://models/Forklift.glb").instantiate()
-	robot_holder.add_child(robot)
-
-	robot.scale = Vector3(0.6, 0.6, 0.6)
-	robot.rotation.y = deg_to_rad(-90)
-	robot.position = Vector3(1.95, -0.04, -32.55)
-
-	var n_node := get_node_or_null("N") as Node3D
-	if n_node == null:
-		push_error("Nao foi possivel colocar o robo na garagem.")
-		return
-
-	var spawn_position := n_node.global_position + Vector3(1.32, 0.0, 0.0)
-	spawn_position.y = EDGE_Y + 0.12
-	robot_holder.global_position = spawn_position
-
-
 func build_robot_garage() -> void:
 	var n_node := get_node_or_null("N") as Node3D
 	if n_node == null:
@@ -86,7 +64,7 @@ func build_robot_garage() -> void:
 
 	var garage := Node3D.new()
 	garage.name = "RobotGarage"
-	garage.global_position = n_node.global_position + Vector3(1.32, 0.0, 0.0)
+	garage.position = n_node.position + Vector3(1.32, 0.0, 0.0)
 	add_child(garage)
 
 	var floor_mat := create_colored_material(Color(0.18, 0.18, 0.18), 0.85)
@@ -213,9 +191,8 @@ func build_nodes(data: Dictionary):
 			add_safety_border(marker, node_type)
 
 			spawn_zone_doors(marker, node_type)
-
-			if node_type == "entry":
-				spawn_animated_box(marker)
+			if node_type == "exit":
+				add_exit_storage_area(marker)
 
 		else:
 			var marker := MeshInstance3D.new()
@@ -295,6 +272,17 @@ func add_border_strip(parent_node: Node3D, size: Vector3, local_pos: Vector3, ma
 	parent_node.add_child(strip)
 
 
+func add_exit_storage_area(parent_node: Node3D) -> void:
+	var pad_mat := create_colored_material(Color(0.12, 0.12, 0.12), 0.85)
+	var rail_mat := create_colored_material(Color(1.0, 0.72, 0.02), 0.55)
+
+	add_box_child(parent_node, "ExitStoragePad", Vector3(0.54, 0.12, 0.76), Vector3(0.92, 0.0, 0), pad_mat)
+	add_box_child(parent_node, "ExitStorageFrontRail", Vector3(0.04, 0.04, 0.76), Vector3(0.67, 0.08, 0), rail_mat)
+	add_box_child(parent_node, "ExitStorageBackRail", Vector3(0.04, 0.04, 0.76), Vector3(1.17, 0.08, 0), rail_mat)
+	add_box_child(parent_node, "ExitStorageLeftRail", Vector3(0.54, 0.04, 0.04), Vector3(0.92, 0.08, -0.36), rail_mat)
+	add_box_child(parent_node, "ExitStorageRightRail", Vector3(0.54, 0.04, 0.04), Vector3(0.92, 0.08, 0.36), rail_mat)
+
+
 func create_colored_material(color: Color, roughness: float) -> StandardMaterial3D:
 	var mat: StandardMaterial3D = StandardMaterial3D.new()
 	mat.albedo_color = color
@@ -315,17 +303,14 @@ func add_box_child(parent_node: Node3D, node_name: String, size: Vector3, local_
 
 
 func spawn_zone_doors(parent_node: Node3D, node_type: String):
-	if node_type == "entry":
-		return
-
-	if node_type == "exit" or "process" in node_type:
-		var hole: MeshInstance3D = create_zone_hole(parent_node)
-		var garage_door: MeshInstance3D = create_garage_door(parent_node)
-		animate_static_garage_door(garage_door, hole, get_garage_door_open_z(node_type))
+	if node_type == "entry" or node_type == "exit" or "process" in node_type:
+		create_zone_hole(parent_node)
+		create_garage_door(parent_node)
 
 
 func create_zone_hole(parent_node: Node3D) -> MeshInstance3D:
 	var hole := MeshInstance3D.new()
+	hole.name = "ZoneHole"
 	var hole_mesh := BoxMesh.new()
 	hole_mesh.size = Vector3(0.44, 0.01, 0.44)
 	hole.mesh = hole_mesh
@@ -343,6 +328,7 @@ func create_zone_hole(parent_node: Node3D) -> MeshInstance3D:
 
 func create_garage_door(parent_node: Node3D) -> MeshInstance3D:
 	var garage_door: MeshInstance3D = MeshInstance3D.new()
+	garage_door.name = "ZoneDoor"
 	var door_mesh: BoxMesh = BoxMesh.new()
 	door_mesh.size = Vector3(0.46, 0.006, 0.46)
 	garage_door.mesh = door_mesh
@@ -355,219 +341,6 @@ func create_garage_door(parent_node: Node3D) -> MeshInstance3D:
 
 	parent_node.add_child(garage_door)
 	return garage_door
-
-
-func get_garage_door_open_z(node_type: String) -> float:
-	return 0.0
-
-
-func spawn_animated_box(parent_node: Node3D):
-	var box_colors = [
-		Color(0.079, 0.672, 0.0, 1.0),
-		Color(0.2, 0.55, 0.9),
-		Color(0.9, 0.1, 0.2)
-	]
-
-	var selected_color = box_colors[randi() % box_colors.size()]
-
-	var container := Node3D.new()
-	parent_node.add_child(container)
-
-	var hole := MeshInstance3D.new()
-	var hole_mesh := BoxMesh.new()
-	hole_mesh.size = Vector3(0.44, 0.01, 0.44)
-	hole.mesh = hole_mesh
-	hole.position = Vector3(0, 0.066, 0)
-	hole.visible = false
-
-	var hole_mat := StandardMaterial3D.new()
-	hole_mat.albedo_color = Color(0.01, 0.01, 0.01)
-	hole_mat.roughness = 1.0
-	hole.material_override = hole_mat
-
-	container.add_child(hole)
-
-	var box := MeshInstance3D.new()
-	var box_mesh := BoxMesh.new()
-	box_mesh.size = Vector3(0.25, 0.25, 0.25)
-	box.mesh = box_mesh
-
-	var box_mat := StandardMaterial3D.new()
-	box_mat.albedo_color = selected_color
-	box_mat.roughness = 1.0
-	box.material_override = box_mat
-
-	box.position = Vector3(0, -0.22, 0)
-	container.add_child(box)
-
-	var garage_door: MeshInstance3D = create_garage_door(container)
-
-	animate_box_with_doors(box, garage_door, hole)
-
-
-func animate_box_with_doors(box: Node3D, garage_door: MeshInstance3D, hole: Node3D) -> void:
-	var tween = create_tween()
-	tween.set_loops()
-
-	box.position = Vector3(0, -0.22, 0)
-	hole.visible = false
-
-	garage_door.position = Vector3(0, 0.068, 0)
-	garage_door.visible = true
-	tween.tween_interval(0.35)
-	tween.tween_callback(Callable(garage_door, "hide"))
-	tween.tween_callback(Callable(hole, "show"))
-
-	tween.tween_property(box, "position:y", 0.22, 0.8)\
-		.set_trans(Tween.TRANS_BACK)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.tween_interval(1.2)
-
-	tween.tween_property(box, "position:y", -0.22, 0.8)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.tween_callback(Callable(hole, "hide"))
-	tween.tween_callback(Callable(garage_door, "show"))
-
-	tween.tween_interval(1.0)
-
-
-func animate_static_garage_door(garage_door: MeshInstance3D, hole: MeshInstance3D, open_z: float):
-	var tween := create_tween()
-	tween.set_loops()
-
-	hole.visible = false
-	garage_door.position = Vector3(0, 0.068, 0)
-	garage_door.visible = true
-
-	tween.tween_interval(0.35)
-	tween.tween_callback(Callable(garage_door, "hide"))
-	tween.tween_callback(Callable(hole, "show"))
-	tween.tween_interval(1.2)
-	tween.tween_callback(Callable(hole, "hide"))
-	tween.tween_callback(Callable(garage_door, "show"))
-
-	tween.tween_interval(1.0)
-
-
-func animate_static_zone_doors_z(bottom_door: Node3D, top_door: Node3D):
-	var tween := create_tween()
-	tween.set_loops()
-
-	bottom_door.position.z = -0.09
-	top_door.position.z = 0.09
-
-	tween.tween_property(bottom_door, "position:z", -0.28, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.parallel().tween_property(top_door, "position:z", 0.28, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.tween_interval(1.2)
-
-	tween.tween_property(bottom_door, "position:z", -0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.parallel().tween_property(top_door, "position:z", 0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.tween_interval(1.0)
-
-
-func animate_static_zone_doors_z_with_hole(bottom_door: Node3D, top_door: Node3D, hole: MeshInstance3D):
-	var tween := create_tween()
-	tween.set_loops()
-
-	hole.visible = false
-	bottom_door.position.z = -0.09
-	top_door.position.z = 0.09
-
-	tween.tween_property(bottom_door, "position:z", -0.28, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.parallel().tween_property(top_door, "position:z", 0.28, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.tween_callback(Callable(hole, "show"))
-	tween.tween_interval(1.2)
-	tween.tween_callback(Callable(hole, "hide"))
-
-	tween.tween_property(bottom_door, "position:z", -0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.parallel().tween_property(top_door, "position:z", 0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.tween_interval(1.0)
-
-
-func animate_static_zone_doors_x(left_door: Node3D, right_door: Node3D):
-	var tween := create_tween()
-	tween.set_loops()
-
-	left_door.position.x = -0.09
-	right_door.position.x = 0.09
-
-	tween.tween_property(left_door, "position:x", -0.29, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.parallel().tween_property(right_door, "position:x", 0.29, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.tween_interval(1.2)
-
-	tween.tween_property(left_door, "position:x", -0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.parallel().tween_property(right_door, "position:x", 0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.tween_interval(1.0)
-
-
-func animate_static_zone_doors_x_with_hole(left_door: Node3D, right_door: Node3D, hole: MeshInstance3D):
-	var tween := create_tween()
-	tween.set_loops()
-
-	hole.visible = false
-	left_door.position.x = -0.09
-	right_door.position.x = 0.09
-
-	tween.tween_property(left_door, "position:x", -0.29, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.parallel().tween_property(right_door, "position:x", 0.29, 0.45)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_OUT)
-
-	tween.tween_callback(Callable(hole, "show"))
-	tween.tween_interval(1.2)
-	tween.tween_callback(Callable(hole, "hide"))
-
-	tween.tween_property(left_door, "position:x", -0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.parallel().tween_property(right_door, "position:x", 0.09, 0.4)\
-		.set_trans(Tween.TRANS_SINE)\
-		.set_ease(Tween.EASE_IN)
-
-	tween.tween_interval(1.0)
 
 
 func build_edges(data: Dictionary):
