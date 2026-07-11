@@ -21,6 +21,14 @@ REWARD_WAYPOINT = 1.0
 REWARD_DELIVERY = 10.0
 REWARD_PICK     = 0.3
 
+# Retornos decrescentes por exit: a n-ésima caixa entregue NO MESMO exit
+# (contando a partir de 0) vale REWARD_DELIVERY * DECAY**n. Assim a 1ª caixa
+# num exit vale 10, a 2ª no mesmo exit vale 10*DECAY, etc. — incentiva o
+# agente a espalhar as entregas por exits diferentes em vez de as concentrar.
+# DECAY=1.0 desliga o efeito (volta a reward fixo); mais baixo = mais pressão
+# para distribuir. O contador é por episódio (reset em `reset`).
+REWARD_DELIVERY_DECAY = 0.6
+
 # Tempo de "máquina" simulado num par process entry->exit — só efeito
 # visual (dá tempo a uma animação no render 3D); a recompensa de waypoint
 # já é dada no drop, não se atrasa. 1 tick = 0.05s (ver env/render/renderer.py).
@@ -32,6 +40,34 @@ _PIPELINE_MAP: dict[str, PipelineType] = {
     "red":   PipelineType.RED,
 }
 
+_LETTER_TO_PIPELINE: dict[str, str] = {"B": "blue", "R": "red", "G": "green"}
+
+
+def parse_box_layout(layout: str) -> list[tuple[int, str]]:
+    """Traduz um layout de caixas por slot de entry numa lista ordenada de
+    (índice_do_entry, nome_da_pipeline).
+
+    Formato: grupos separados por espaços, um por entry começando no entryA
+    (slot 0 = entryA, 1 = entryB, ...). Cada grupo é a sequência de cores
+    que nasce nesse entry, por ordem. Letras: B=blue, R=red, G=green;
+    '-'/'.'/'_' marcam um slot vazio.
+
+    Ex.: "BB RG GG B" → entryA lança 2 azuis, entryB 1 vermelha depois 1
+    verde, entryC 2 verdes, entryD 1 azul (7 caixas no total).
+    """
+    out: list[tuple[int, str]] = []
+    for slot_idx, group in enumerate(layout.split()):
+        for ch in group:
+            if ch in "-._":
+                continue
+            key = _LETTER_TO_PIPELINE.get(ch.upper())
+            if key is None:
+                raise ValueError(
+                    f"Letra de cor desconhecida em box_layout: {ch!r} (usa B/R/G)"
+                )
+            out.append((slot_idx, key))
+    return out
+
 
 class BoxManager:
     """Ciclo de vida das caixas: spawn lazy nos entries, pick/drop, opções."""
@@ -41,23 +77,44 @@ class BoxManager:
         pipeline_path: str | Path,
         n_boxes: int = 8,
         seed: Optional[int] = None,
+        layout: str | None = None,
     ) -> None:
-        """Carrega a config de pipelines e prepara o gerador de caixas."""
+        """Carrega a config de pipelines e prepara o gerador de caixas.
+
+        Se `layout` for dado (ex. "BB RG GG B"), as caixas são criadas
+        deterministicamente (entry + cor por slot, ver `parse_box_layout`) e
+        `n_boxes` passa a ser o total do layout, ignorando o argumento."""
         self._pipeline_path = Path(pipeline_path)
-        self._n_boxes       = n_boxes
         self._rng           = random.Random(seed)
         self._pipeline_cfg  = self._load_pipeline_cfg()
+
+        self._layout : list[tuple[int, str]] | None = (
+            parse_box_layout(layout) if layout else None
+        )
+        self._n_boxes = len(self._layout) if self._layout is not None else n_boxes
 
         self._boxes       : dict[int, Box] = {}
         self._spawn_queue : list[Box]      = []
         self._next_id     : int            = 0
+        self._exit_deliveries : dict[str, int] = {}
 
-    def reset(self, seed: Optional[int] = None) -> None:
-        """Cria todas as caixas e activa as que cabem nos entries livres."""
+    @property
+    def n_boxes(self) -> int:
+        """Número total de caixas do episódio (derivado do layout se houver)."""
+        return self._n_boxes
+
+    def reset(self, seed: Optional[int] = None, n_boxes: Optional[int] = None) -> None:
+        """Cria todas as caixas e activa as que cabem nos entries livres.
+
+        `n_boxes` (só no modo aleatório, sem layout) permite variar o número
+        de caixas por episódio — ignorado se houver `layout`."""
         if seed is not None:
             self._rng = random.Random(seed)
+        if n_boxes is not None and self._layout is None:
+            self._n_boxes = n_boxes
         self._boxes.clear()
         self._spawn_queue.clear()
+        self._exit_deliveries.clear()
         self._next_id = 0
 
         all_entries: list[str] = []
@@ -66,6 +123,18 @@ class BoxManager:
             if entries:
                 all_entries = entries
                 break
+
+        if self._layout is not None:
+            # Layout explícito: entry por slot (0=entryA...) e cor fixa por
+            # caixa, na ordem dada. Agrupados por entry → a 1ª de cada entry
+            # nasce logo, as seguintes ficam em fila até o entry libertar.
+            for slot_idx, pipeline_name in self._layout:
+                entry = all_entries[slot_idx] if slot_idx < len(all_entries) else None
+                self._spawn_queue.append(
+                    self._create_pending_box(entry, forced_pipeline=pipeline_name)
+                )
+            self.tick_spawn()
+            return
 
         if all_entries and len(all_entries) >= self._n_boxes:
             entry_pool = self._rng.sample(all_entries, self._n_boxes)
@@ -137,7 +206,13 @@ class BoxManager:
         machine_free = landed == node or not self._is_node_occupied(landed)
         delivered = box.apply_drop(node, now, process_delay=PROCESS_DELAY_TICKS,
                                     machine_free=machine_free)
-        return (REWARD_DELIVERY if delivered else REWARD_WAYPOINT), delivered
+        if not delivered:
+            return REWARD_WAYPOINT, False
+        # Retornos decrescentes: escala pela nº de caixas já entregues NESTE
+        # exit (antes desta). Ver REWARD_DELIVERY_DECAY.
+        n = self._exit_deliveries.get(node, 0)
+        self._exit_deliveries[node] = n + 1
+        return REWARD_DELIVERY * (REWARD_DELIVERY_DECAY ** n), True
 
     def _is_node_occupied(self, node: str) -> bool:
         """True se alguma caixa está WAITING (pousada, por levantar) nesse nó."""
@@ -218,10 +293,15 @@ class BoxManager:
             for b in self._boxes.values()
         ]
 
-    def _create_pending_box(self, forced_entry: str | None = None) -> Box:
-        """Cria uma caixa nova com pipeline aleatória e entry fixo (forçado
-        ou aleatório), pronta a spawnar."""
-        pipeline_name = self._rng.choice(list(self._pipeline_cfg.keys()))
+    def _create_pending_box(
+        self, forced_entry: str | None = None, forced_pipeline: str | None = None,
+    ) -> Box:
+        """Cria uma caixa nova, pronta a spawnar. Pipeline forçada
+        (`forced_pipeline`) ou aleatória; entry fixo (forçado) ou aleatório."""
+        pipeline_name = (
+            forced_pipeline if forced_pipeline is not None
+            else self._rng.choice(list(self._pipeline_cfg.keys()))
+        )
         cfg           = self._pipeline_cfg[pipeline_name]
         constraints   = cfg.get("constraints", {})
         sequence      = list(cfg.get("sequence", []))

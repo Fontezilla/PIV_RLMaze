@@ -1,6 +1,25 @@
 env:
-  n_robots: 3
-  n_boxes: 6
+  # === MODO ESPECIFICO ===
+  # Layout explícito de caixas por slot de entry (entryA..entryD), separado
+  # por espaços. Letras: B=blue, R=red, G=green; '-' = slot vazio. Cada grupo
+  # é a sequência que nasce nesse entry, por ordem. Ex.: "BB RG GG B" = entryA
+  # 2 azuis, entryB vermelha+verde, entryC 2 verdes, entryD 1 azul (7 caixas).
+  # Neste modo n_robots é fixo e o total de caixas vem do layout.
+  # Sobreponível na linha de comandos: --box-layout "BB RG GG B"
+  box_layout: "BB RG GG B"
+  n_robots: 2
+
+  # === MODO ALEATORIO (box_layout vazio "") ===
+  # A cada episódio amostra o nº de robots em [robots_min, robots_max] e o
+  # de caixas em [boxes_min, boxes_max], com cores aleatórias (domain
+  # randomization — treina a política a generalizar). Forçar por CLI com
+  # --box-layout ""
+  robots_min: 2
+  robots_max: 3
+  boxes_min: 4
+  boxes_max: 8
+  n_boxes: 4          # fallback (só se ranges ausentes)
+
   tick_limit: 8000
   map_path: ".configs/map_factory.yaml"
   cache_path: ".configs/graph_cache.pkl"
@@ -15,12 +34,16 @@ agent:
 train:
   n_episodes: 2000
   n_workers: 6
+  episodes_per_update: 24
   lr: 0.0003
   gamma: 0.99
   lam: 0.95
   clip_eps: 0.2
   value_coef: 0.5
-  entropy_coef_start: 0.02
+  # Fine-tuning/continuação (--resume): manter baixo e fixo (0.005) para não
+  # reinjectar exploração alta por cima de uma política já convergida.
+  # Para treino DE RAIZ, volta a pôr start=0.02 (explora no início, decai).
+  entropy_coef_start: 0.005
   entropy_coef_end: 0.005
   n_epochs: 4
   normalize_advantages: true
@@ -30,6 +53,12 @@ eval:
   every_n_episodes: 100
   n_eval_episodes: 5
   render: false
+  # Cenário FIXO de avaliação (termómetro estável). Mesmo que o treino corra
+  # em modo aleatório, a avaliação usa sempre este layout — dá uma métrica
+  # comparável entre checkpoints. Deixa vazio ("") para avaliar no mesmo modo
+  # do treino. Com layout fixo + política determinística, n_eval_episodes=1
+  # chega (todos os episódios seriam idênticos).
+  box_layout: "BB RG GG B"
 
 checkpoints:
   dir: "checkpoints"

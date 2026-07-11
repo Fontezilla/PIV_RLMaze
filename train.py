@@ -37,6 +37,11 @@ def _init_worker(cfg: dict) -> None:
     """Inicializa env e policy no processo worker (executado uma única vez
     por processo — reutilizados em todos os episódios recolhidos por ele)."""
     global _WORKER_ENV, _WORKER_POLICY
+    # Cada worker já é um processo em paralelo com os outros — sem isto, o
+    # PyTorch tenta usar várias threads por processo (default = nº de cores)
+    # e os `n_workers` processos disputam os mesmos cores entre si, anulando
+    # o ganho do paralelismo.
+    torch.set_num_threads(1)
     cfg_w = copy.deepcopy(cfg)
     cfg_w["agent"]["device"] = "cpu"   # GPU não é partilhável entre processos
     _WORKER_ENV    = make_env(cfg_w)
@@ -59,7 +64,7 @@ def _collect_episode(args: tuple) -> tuple[dict, list]:
 
 def load_config(path: str) -> dict:
     """Carrega o ficheiro de configuração YAML."""
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -91,6 +96,11 @@ def make_env(cfg: dict) -> FactoryEnv:
         map_path      = env_cfg["map_path"],
         cache_path    = env_cfg["cache_path"],
         pipeline_path = env_cfg["pipeline_path"],
+        box_layout    = env_cfg.get("box_layout"),
+        robots_min    = env_cfg.get("robots_min"),
+        robots_max    = env_cfg.get("robots_max"),
+        boxes_min     = env_cfg.get("boxes_min"),
+        boxes_max     = env_cfg.get("boxes_max"),
     )
 
 
@@ -203,7 +213,15 @@ def evaluate(
     render: bool = True,
     explain: bool = False,
 ) -> dict[str, float]:
-    """Corre N episódios de avaliação em modo determinístico."""
+    """Corre N episódios de avaliação em modo determinístico.
+
+    Se `eval.box_layout` estiver definido na config, a avaliação usa sempre
+    esse cenário fixo (mesmo que o treino corra em modo aleatório) — dá uma
+    métrica comparável entre checkpoints, sem o ruído de nº de caixas variar."""
+    eval_layout = cfg.get("eval", {}).get("box_layout")
+    if eval_layout:
+        cfg = copy.deepcopy(cfg)
+        cfg["env"]["box_layout"] = eval_layout
     env = make_env(cfg)
 
     rewards    = []
@@ -294,15 +312,28 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg["lr"])
 
-    # Critério de melhor modelo: minimizar ticks_to_all_done (eficiência).
-    # Fase inicial (all_done_rate < 0.5): fallback para maximizar all_done_rate.
-    best_ticks_to_all_done = float("inf")
-    best_all_done_rate     = 0.0
+    # Critério de melhor modelo: maximizar reward_mean — inclui o objectivo
+    # completo (entregas com distribuição pelos exits MENOS penalização de
+    # tempo), ao contrário de ticks_to_all_done que só media velocidade e
+    # penalizava distribuir. Fase inicial (all_done_rate < 0.5): fallback
+    # para maximizar all_done_rate.
+    best_reward        = float("-inf")
+    best_all_done_rate = 0.0
+
+    env_cfg = cfg["env"]
+    if env_cfg.get("box_layout"):
+        scenario = (f"layout=\"{env_cfg['box_layout']}\"  "
+                    f"n_robots={env_cfg['n_robots']}  n_boxes={env.n_boxes}")
+    else:
+        rmin = env_cfg.get("robots_min", env_cfg["n_robots"])
+        rmax = env_cfg.get("robots_max", env_cfg["n_robots"])
+        bmin = env_cfg.get("boxes_min", env_cfg["n_boxes"])
+        bmax = env_cfg.get("boxes_max", env_cfg["n_boxes"])
+        scenario = f"ALEATÓRIO  n_robots={rmin}-{rmax}  n_boxes={bmin}-{bmax}"
 
     print(f"\n{'=' * 60}")
     print("  Factory RL (novo env — SIPP) — GNN + PPO")
-    print(f"  n_robots={cfg['env']['n_robots']}  "
-          f"n_boxes={cfg['env']['n_boxes']}  "
+    print(f"  {scenario}  "
           f"hidden_dim={cfg['agent']['hidden_dim']}  "
           f"n_workers={train_cfg.get('n_workers', 1)}")
     print(f"{'=' * 60}\n")
@@ -326,14 +357,24 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
             prev_ep = episode
 
             if use_parallel:
-                batch  = min(n_workers, train_cfg["n_episodes"] - episode)
+                episodes_per_update = train_cfg.get("episodes_per_update", n_workers)
+                target = min(episodes_per_update, train_cfg["n_episodes"] - episode)
                 cpu_sd = {k: v.cpu() for k, v in policy.net.state_dict().items()}
-                results = list(executor.map(
-                    _collect_episode,
-                    [(cpu_sd, episode + i) for i in range(batch)],
-                ))
-                combined_traj = [t for _, traj in results for t in traj]
-                metrics_list  = [m for m, _ in results]
+
+                combined_traj: list = []
+                metrics_list: list = []
+                collected = 0
+                while collected < target:
+                    round_batch = min(n_workers, target - collected)
+                    results = list(executor.map(
+                        _collect_episode,
+                        [(cpu_sd, episode + collected + i) for i in range(round_batch)],
+                    ))
+                    combined_traj.extend(t for _, traj in results for t in traj)
+                    metrics_list.extend(m for m, _ in results)
+                    collected += round_batch
+                    pbar.update(round_batch)
+                batch = collected
 
                 entropy_coef = _entropy_coef(episode, train_cfg["n_episodes"], train_cfg)
                 update_metrics = policy.update(
@@ -354,14 +395,13 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
                 ep_metrics = {
                     "total_reward" : sum(m["total_reward"] for m in metrics_list) / n,
                     "delivered"    : sum(m["delivered"]    for m in metrics_list) / n,
-                    "n_boxes"      : env.n_boxes,
+                    "n_boxes"      : sum(m["n_boxes"]      for m in metrics_list) / n,
                     "all_delivered": any(m["all_delivered"] for m in metrics_list),
                     "ticks"        : sum(m["ticks"]        for m in metrics_list) / n,
                     "n_steps"      : sum(m["n_steps"]      for m in metrics_list) / n,
                     "duration_s"   : sum(m["duration_s"]   for m in metrics_list) / n,
                 }
                 episode += batch
-                pbar.update(batch)
 
             else:
                 ep_metrics   = run_episode(env, policy, deterministic=False, record=True)
@@ -383,7 +423,7 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
 
             pbar.set_postfix({
                 "R"  : f"{ep_metrics['total_reward']:.1f}",
-                "del": f"{ep_metrics['delivered']:.1f}/{env.n_boxes}",
+                "del": f"{ep_metrics['delivered']:.1f}/{ep_metrics['n_boxes']:.0f}",
                 "H"  : f"{update_metrics.get('entropy', 0):.2f}",
                 "H_c": f"{entropy_coef:.3f}",
                 "p_L": f"{update_metrics.get('policy_loss', 0):.3f}",
@@ -435,10 +475,11 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
                     f"reward_mean={eval_metrics['eval/reward_mean']:.1f}\n"
                 )
 
-                cur_rate = eval_metrics["eval/all_done_rate"]
+                cur_rate   = eval_metrics["eval/all_done_rate"]
+                cur_reward = eval_metrics["eval/reward_mean"]
                 is_better = False
-                if cur_rate >= 0.5 and t2ad < best_ticks_to_all_done:
-                    best_ticks_to_all_done = t2ad
+                if cur_rate >= 0.5 and cur_reward > best_reward:
+                    best_reward = cur_reward
                     is_better = True
                 elif cur_rate < 0.5 and cur_rate > best_all_done_rate:
                     best_all_done_rate = cur_rate
@@ -447,7 +488,7 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
                 if is_better:
                     policy.save(str(ckpt_dir / "best.pt"))
                     label = (
-                        f"ticks_all_done={best_ticks_to_all_done:.0f}"
+                        f"reward={best_reward:.1f}"
                         if cur_rate >= 0.5 else
                         f"all_done_rate={best_all_done_rate:.2f}"
                     )
@@ -463,8 +504,8 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
             wandb.finish()
 
     print("\nTreino concluído.")
-    if best_ticks_to_all_done != float("inf"):
-        print(f"Melhor ticks_to_all_done: {best_ticks_to_all_done:.0f}")
+    if best_reward != float("-inf"):
+        print(f"Melhor reward_mean: {best_reward:.1f}")
     else:
         print(f"Melhor all_done_rate: {best_all_done_rate:.2f}")
     print(f"Checkpoints em: {ckpt_dir}/")
@@ -505,6 +546,20 @@ def parse_args() -> argparse.Namespace:
         help    = "Caminho para o ficheiro de configuração YAML",
     )
     parser.add_argument(
+        "--box-layout",
+        type    = str,
+        default = None,
+        help    = "Sequência fixa de caixas por slot de entry (ex.: \"BB RG GG B\"; "
+                  "B=blue R=red G=green, '-'=vazio). Sobrepõe-se à config.",
+    )
+    parser.add_argument(
+        "--random",
+        action  = "store_true",
+        help    = "Força o modo aleatório (robots/caixas variáveis por episódio, "
+                  "cores random). Equivale a box_layout vazio; sobrepõe-se à config "
+                  "e a --box-layout.",
+    )
+    parser.add_argument(
         "--no-wandb",
         action  = "store_true",
         help    = "Desactiva o logging para wandb",
@@ -538,6 +593,13 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     cfg  = load_config(args.config)
+
+    # CLI sobrepõe-se à config: --random força o modo aleatório; --box-layout
+    # "SEQ" fixa a sequência; nenhum dos dois usa a config.
+    if args.random:
+        cfg["env"]["box_layout"] = ""
+    elif args.box_layout is not None:
+        cfg["env"]["box_layout"] = args.box_layout
 
     if args.eval:
         eval_only(cfg, args)

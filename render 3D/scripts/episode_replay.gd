@@ -75,6 +75,9 @@ var _zone_door_tweens: Dictionary = {}  # node name -> Tween
 var _events: Array = []
 var _event_idx := 0
 
+var _paused := true  # começa pausado, para dar tempo a posicionar a câmara
+var _pause_button: Button
+
 
 func _ready() -> void:
 	_factory = get_parent()
@@ -96,10 +99,41 @@ func _initialize() -> void:
 
 	_spawn_robots()
 	_spawn_boxes()
+	_build_pause_ui()
+
+
+func _build_pause_ui() -> void:
+	# Botão fixo no canto superior direito (CanvasLayer = espaço de ecrã,
+	# independente da câmara 3D) para pausar/retomar os robots sem mexer na
+	# câmara — permite posicionar a câmara com calma enquanto os robots
+	# ficam parados.
+	var layer := CanvasLayer.new()
+	layer.name = "HUD"
+	add_child(layer)
+
+	_pause_button = Button.new()
+	_pause_button.text = "▶ Play"
+	_pause_button.anchor_left = 1.0
+	_pause_button.anchor_right = 1.0
+	_pause_button.anchor_top = 0.0
+	_pause_button.anchor_bottom = 0.0
+	_pause_button.offset_left = -120.0
+	_pause_button.offset_right = -10.0
+	_pause_button.offset_top = 10.0
+	_pause_button.offset_bottom = 46.0
+	_pause_button.pressed.connect(_on_pause_pressed)
+	layer.add_child(_pause_button)
+
+
+func _on_pause_pressed() -> void:
+	_paused = not _paused
+	_pause_button.text = "▶ Play" if _paused else "⏸ Pause"
 
 
 func _process(delta: float) -> void:
 	if _episode.is_empty():
+		return
+	if _paused:
 		return
 
 	_sim_time += delta * PLAYBACK_SPEED / TICK_DURATION
@@ -518,10 +552,18 @@ func _update_robot(robot_id, delta: float) -> void:
 		var dir := (look_target - robot.global_position).normalized()
 		var current_forward := -robot.global_transform.basis.z.normalized()
 
-		# Se a direcção a seguir for quase oposta à que já está virado, é
-		# uma marcha-atrás (ex. sair de um beco sem saída, como uma estação
-		# de processo) — mantém a orientação e não roda, só anda para trás.
-		if current_forward.dot(dir) > REVERSE_DOT_THRESHOLD:
+		# Regra real da física (rules.is_reverse_move, lado Python): o robot só
+		# roda de verdade em JUNÇÕES — fora delas (entries/exits/estações de
+		# processo/corredores) nunca roda, só segue em frente ou recua mantendo
+		# a orientação. Antes disto decidíamos só pelo ângulo, o que falhava
+		# quando dois troços seguidos (ex. processo -> processo) somavam uma
+		# reversão total mesmo passando por uma junção real no meio, onde a
+		# rotação deveria acontecer.
+		var cur_type: String = _factory.node_types.get(cur["node"], "corridor")
+		var is_junction: bool = cur_type == "junction"
+		var should_rotate: bool = is_junction or current_forward.dot(dir) > REVERSE_DOT_THRESHOLD
+
+		if should_rotate:
 			var target_quat := Quaternion(Basis.looking_at(dir, Vector3.UP))
 			var t: float = clamp(ROBOT_TURN_SPEED * delta, 0.0, 1.0)
 			robot.quaternion = robot.quaternion.slerp(target_quat, t)

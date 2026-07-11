@@ -11,6 +11,12 @@ var max_x := -INF
 var min_z := INF
 var max_z := -INF
 
+# node_id -> tipo ("junction", "entry", "exit", "processA_entry", ...) — usado
+# pelo episode_replay.gd para saber onde o robot pode rodar de verdade (só em
+# junções, ver rules.is_reverse_move no lado Python) vs onde só pode seguir
+# em frente ou recuar (entries/exits/estações de processo/corredores).
+var node_types: Dictionary = {}
+
 
 func _ready():
 	randomize()
@@ -156,6 +162,7 @@ func build_nodes(data: Dictionary):
 	for id in data["nodes"]:
 		var node_data: Dictionary = data["nodes"][id]
 		var node_type: String = node_data["type"]
+		node_types[id] = node_type
 
 		var pos := map_to_world(node_data["coords"])
 

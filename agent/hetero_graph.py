@@ -19,7 +19,7 @@ from torch_geometric.data import HeteroData
 _MAP_X_MAX = 1160.0
 _MAP_Y_MAX = 1385.0
 
-MAX_ROBOTS_PER_NODE = 4
+MAX_ROBOTS_PER_NODE = 2
 _MAX_BOXES_PER_NODE = 4
 
 _NODE_TYPES = [

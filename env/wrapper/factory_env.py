@@ -13,6 +13,7 @@ ao contrato do agente GNN quando o ligarmos).
 from __future__ import annotations
 
 import heapq
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -89,15 +90,37 @@ class FactoryEnv:
         pipeline_path: str | Path = ".configs/box_pipeline.yaml",
         seed: Optional[int] = None,
         record: bool = False,
+        box_layout: str | None = None,
+        robots_min: Optional[int] = None,
+        robots_max: Optional[int] = None,
+        boxes_min: Optional[int] = None,
+        boxes_max: Optional[int] = None,
     ) -> None:
         """Carrega grafo e pipelines. `record=True` guarda trajectórias e um
-        log de caixas para reprodução no renderer."""
+        log de caixas para reprodução no renderer.
+
+        Dois modos, decididos por `box_layout`:
+        - **específico** (`box_layout` dado, ex. "BB RG GG B"): entry+cor de
+          cada caixa fixos por slot, `n_robots` fixo, total de caixas vem do
+          layout.
+        - **aleatório** (`box_layout` vazio/None): cores aleatórias e, a cada
+          `reset`, o nº de robots é amostrado em [robots_min, robots_max] e o
+          de caixas em [boxes_min, boxes_max] (domain randomization). Se os
+          limites não forem dados, degeneram para `n_robots`/`n_boxes` fixos."""
         self.n_robots = n_robots
-        self.n_boxes = n_boxes
         self.tick_limit = tick_limit
         self.graph = FactoryGraph(str(map_path), str(cache_path))
-        self._box_manager = BoxManager(pipeline_path, n_boxes=n_boxes, seed=seed)
+        self._box_manager = BoxManager(pipeline_path, n_boxes=n_boxes, seed=seed,
+                                       layout=box_layout)
+        self.n_boxes = self._box_manager.n_boxes
         self._seed = seed
+
+        self._random_mode = not box_layout
+        self._robots_min = robots_min if robots_min is not None else n_robots
+        self._robots_max = robots_max if robots_max is not None else n_robots
+        self._boxes_min  = boxes_min  if boxes_min  is not None else n_boxes
+        self._boxes_max  = boxes_max  if boxes_max  is not None else n_boxes
+        self._sample_rng = random.Random(seed)
 
         self.clock: float = 0.0
         self.robots: list[RobotState] = []
@@ -121,7 +144,14 @@ class FactoryEnv:
         robot a esperar esse intervalo. Avança logo o primeiro nascimento
         possível, para o estado devolvido já ter pelo menos um robot
         pendente."""
-        self._box_manager.reset(seed if seed is not None else self._seed)
+        # Modo aleatório: amostra nº de robots e caixas por episódio.
+        if self._random_mode:
+            self.n_robots = self._sample_rng.randint(self._robots_min, self._robots_max)
+            n_boxes = self._sample_rng.randint(self._boxes_min, self._boxes_max)
+            self._box_manager.reset(seed if seed is not None else self._seed, n_boxes=n_boxes)
+        else:
+            self._box_manager.reset(seed if seed is not None else self._seed)
+        self.n_boxes = self._box_manager.n_boxes
         self.reservations.reset()
         self.clock = 0.0
 

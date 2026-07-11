@@ -18,14 +18,14 @@ import pygame.gfxdraw
 from env.core.graph import FactoryGraph
 
 
-BG_COLOR      = (18, 18, 24)
-PANEL_BORDER  = (55, 55, 70)
-EDGE_COLOR    = (55, 65, 80)
-SUBEDGE_COLOR = (36, 40, 50)
-TEXT_COLOR    = (220, 220, 235)
-DIM_TEXT      = (120, 120, 140)
-HEADER_COLOR  = (255, 220, 80)
-GOAL_COLOR    = (255, 220, 50)
+BG_COLOR      = (255, 255, 255)
+PANEL_BORDER  = (200, 200, 210)
+EDGE_COLOR    = (70, 80, 95)
+SUBEDGE_COLOR = (170, 175, 185)
+TEXT_COLOR    = (30, 30, 40)
+DIM_TEXT      = (100, 100, 115)
+HEADER_COLOR  = (215, 130, 0)
+GOAL_COLOR    = (230, 170, 20)
 
 NODE_COLORS = {
     "entry": (76, 175, 80), "junction": (96, 125, 139),
@@ -38,7 +38,7 @@ BOX_COLORS = {"BLUE": (80, 160, 255), "GREEN": (80, 210, 100), "RED": (255, 90, 
 ROBOT_MOVING = (100, 220, 130)
 ROBOT_WAIT   = (255, 160, 40)
 ROBOT_IDLE   = (149, 61, 168)
-ROBOT_DONE   = (180, 180, 210)
+ROBOT_DONE   = (140, 140, 165)
 STATUS_COLOR = {"MOVING": ROBOT_MOVING, "WAITING": ROBOT_WAIT,
                 "AGUARDA": ROBOT_IDLE, "DONE": ROBOT_DONE}
 
@@ -96,7 +96,7 @@ def _draw_triangle(screen, center, size, color, angle):
     ca, sa = math.cos(angle), math.sin(angle)
     pts = [(int(cx + p[0] * ca - p[1] * sa), int(cy + p[0] * sa + p[1] * ca)) for p in pts_local]
     pygame.gfxdraw.filled_polygon(screen, pts, color)
-    pygame.gfxdraw.aapolygon(screen, pts, (230, 230, 250))
+    pygame.gfxdraw.aapolygon(screen, pts, (40, 40, 55))
 
 
 def _draw_graph(screen, graph, tf):
@@ -111,7 +111,7 @@ def _draw_graph(screen, graph, tf):
             continue
         color = NODE_COLORS.get(graph.node_type(n), (96, 96, 96))
         pygame.gfxdraw.filled_circle(screen, px, py, NODE_RADIUS, color)
-        pygame.gfxdraw.aacircle(screen, px, py, NODE_RADIUS, (200, 210, 220))
+        pygame.gfxdraw.aacircle(screen, px, py, NODE_RADIUS, (60, 70, 80))
 
 
 def _draw_boxes(screen, graph, tf, boxes, robot_pos):
@@ -238,7 +238,7 @@ def play(graph: FactoryGraph, players: dict, box_log: list, title: str = "Factor
             color = STATUS_COLOR.get(s["status"], ROBOT_MOVING)
             pygame.draw.circle(screen, (90, 90, 110), (px, py), foot_px, 1)
             _draw_triangle(screen, (px, py), ROBOT_RADIUS, color, s["angle"])
-            lbl = f_sm.render(rid.replace("robot_", "r"), True, (230, 210, 255))
+            lbl = f_sm.render(rid.replace("robot_", "r"), True, (90, 60, 120))
             screen.blit(lbl, (px - lbl.get_width() // 2, py - foot_px - 14))
 
         _draw_panel(screen, (f_sm, f_md, f_lg, f_hdr), graph_w, WINDOW_W, WINDOW_H,
@@ -277,9 +277,9 @@ def _draw_panel(screen, fonts, panel_x, window_w, window_h, t, speed, states, bo
     txt("ROBOTS", HEADER_COLOR, f_lg)
     for rid, s in states.items():
         c = STATUS_COLOR.get(s["status"], TEXT_COLOR)
-        txt(f"  {rid.replace('robot_', 'r')}  {s['status']}", c, f_sm)
+        txt(f"  {rid.replace('robot_', 'r')}  {s['status']}  v={s['speed']:.1f}", c, f_sm)
         if s["status"] == "MOVING":
-            txt(f"    {s['from_node']} -> {s['to_node']}  v={s['speed']:.0f}", DIM_TEXT, f_sm)
+            txt(f"    {s['from_node']} -> {s['to_node']}", DIM_TEXT, f_sm)
         else:
             txt(f"    @ {s['from_node']}", DIM_TEXT, f_sm)
     py[0] += 8
